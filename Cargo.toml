@@ -1,0 +1,18 @@
+[package]
+name = "ezcompute"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bumpalo = "3.14.0"
+bytemuck = { version = "1.14", features=["derive"] }
+env_logger = { version = "0.11.0", default-features=false }
+lodepng = "3.10.1"
+pollster = "0.3"
+wgpu = "0.19"
+winit = { version = "0.29", default-features=false, features=["x11", "rwh_06"] }
+x264 = "0.5.0"
+y4m = "0.8.0"
+
+[profile.dev]
+opt-level=2
