@@ -310,6 +310,7 @@ impl Ctx {
     {
         let texture = self.create_texture(size, wgpu::TextureFormat::Rgba8Unorm);
         let size = (size.0 as usize, size.1 as usize);
+        let size_i = (size.0 as i32, size.1 as i32);
 
         let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
 
@@ -323,12 +324,13 @@ impl Ctx {
                 .write(true)
                 .open(std::path::Path::new(output)).expect("could not open or create file");
 
-            let mut encoder = y4m::encode(size.0, size.1, y4m::Ratio::new(frame_rate, 1))
-                .with_colorspace(y4m::Colorspace::C444)
-                .write_header(file)
+            let mut encoder = x264::Setup::preset(x264::Preset::Medium, x264::Tune::None, false, false)
+                .fps(frame_rate, 1)
+                .build(x264::Colorspace::BGRA, size_i.0, size_i.1)
                 .unwrap();
 
-            let mut frame_num = 0;
+            use std::io::Write;
+            file.write_all(encoder.headers().unwrap());
 
             let mut frame_num = 0;
             loop {
@@ -337,14 +339,12 @@ impl Ctx {
                     Err(_) => break
                 };
 
-                convert_rgba_to_yuv444p(&rgba_buf, size.0, size.1, &mut y_buf, &mut u_buf, &mut v_buf);
-
-                let frame = y4m::Frame::new([&y_buf, &u_buf, &v_buf], None);
-                if frame_num == frame_count { break }
-                frame_num += 1;
-                print!("encoding frame {}/{}\r", frame_num, frame_count);
-                encoder.write_frame(&frame).unwrap();
+                let image = x264::Image::bgra(size_i.0, size_i.1, rgba_buf);
+                let (data, _) = encoder.encoder(0, image).unwrap();
+                file.write_all(data.entirety());
             }
+
+            file.flush();
         });
 
         for _ in 0..frame_count {
@@ -1105,87 +1105,3 @@ where
         self.size_hint().0
     }
 }
-
-/// adopted from https://github.com/marcellBan/rgb2yuv420-rs
-fn convert_rgba_to_yuv444p(
-    img: &[u8],
-    width: usize,
-    height: usize,
-    y_buffer: &mut [u8],
-    u_buffer: &mut [u8],
-    v_buffer: &mut [u8],
-) {
-    let frame_size = width * height;
-
-    assert!(y_buffer.len() >= frame_size);
-    assert!(u_buffer.len() >= frame_size);
-    assert!(v_buffer.len() >= frame_size);
-
-    let chroma_size = frame_size / 4;
-    let mut yuv_index = 0;
-    let mut index = 0;
-    for j in 0..height {
-        for _ in 0..width {
-            use std::ops::Mul;
-            let r = f32::from(img[index + 0]).mul(1.5).min(255.0);
-            let g = f32::from(img[index + 1]).mul(1.5).min(255.0);
-            let b = f32::from(img[index + 2]).mul(1.5).min(255.0);
-
-            let y = ( 0.257 * r + 0.504 * g + 0.098 * b +  16.0) as u8;
-            let u = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0) as u8;
-            let v = ( 0.439 * r - 0.368 * g - 0.071 * b + 128.0) as u8;
-
-            index += 4;
-
-            y_buffer[yuv_index] = y;
-            u_buffer[yuv_index] = u;
-            v_buffer[yuv_index] = v;
-            yuv_index += 1;
-        }
-    }
-}
-
-///// adopted from https://github.com/marcellBan/rgb2yuv420-rs
-//fn convert_rgb_to_yuv420p(
-//    img: &[u8],
-//    width: u32,
-//    height: u32,
-//    bytes_per_pixel: usize,
-//    yuv_buffer: &mut [u8]
-//) {
-//    assert!(yuv_buffer.len() >= (width * height * 3 / 2) as usize);
-//
-//    let frame_size = (width * height) as usize;
-//    let chroma_size = frame_size / 4;
-//    let mut y_index = 0;
-//    let mut uv_index = frame_size;
-//    let mut index = 0;
-//    for j in 0..height {
-//        for _ in 0..width {
-//            let r = i32::from(img[index + 0]);
-//            let g = i32::from(img[index + 1]);
-//            let b = i32::from(img[index + 2]);
-//            index += bytes_per_pixel;
-//            yuv_buffer[y_index] = clamp((77 * r + 150 * g + 29 * b + 128) >> 8);
-//            y_index += 1;
-//            if j % 2 == 0 && index % 2 == 0 {
-//                let u = clamp(((-43 * r - 84 * g + 127 * b + 128) >> 8) + 128);
-//                let v = clamp(((127 * r - 106 * g - 21 * b + 128) >> 8) + 128);
-//                yuv_buffer[uv_index] = u;
-//                yuv_buffer[uv_index + chroma_size] = v;
-//                uv_index += 1;
-//            }
-//        }
-//    }
-//}
-//
-//fn clamp(val: i32) -> u8 {
-//    if val < 0 {
-//        0
-//    } else if val > 255 {
-//        255
-//    } else {
-//        val as u8
-//    }
-//}
-//
