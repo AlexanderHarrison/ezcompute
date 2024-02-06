@@ -303,48 +303,66 @@ impl Ctx {
         output: &'static str, 
         size: (u32, u32), 
         frame_count: u32, 
-        frame_rate: usize,
+        frame_rate: u32,
         mut f: F
     ) where
         F: FnMut(&Texture)
     {
-        let texture = self.create_texture(size, wgpu::TextureFormat::Rgba8Unorm);
+        let texture = self.create_texture(size, wgpu::TextureFormat::Bgra8UnormSrgb);
         let size = (size.0 as usize, size.1 as usize);
         let size_i = (size.0 as i32, size.1 as i32);
 
         let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
 
         let write_thread = std::thread::spawn(move || {
-            let mut y_buf = vec![0u8; size.0 * size.1];
-            let mut u_buf = vec![0u8; size.0 * size.1];
-            let mut v_buf = vec![0u8; size.0 * size.1];
-
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::io::BufWriter::new(std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
-                .open(std::path::Path::new(output)).expect("could not open or create file");
+                .open(std::path::Path::new(output))
+                .expect("could not open or create file"));
 
-            let mut encoder = x264::Setup::preset(x264::Preset::Medium, x264::Tune::None, false, false)
+            let mut encoder = x264::Setup::preset(x264::Preset::Veryslow, x264::Tune::None, false, false)
+                .timebase(1, 90_000)
                 .fps(frame_rate, 1)
+                .annexb(false)
                 .build(x264::Colorspace::BGRA, size_i.0, size_i.1)
                 .unwrap();
 
-            use std::io::Write;
-            file.write_all(encoder.headers().unwrap());
+            let mp4_writer = mp4::Mp4Writer::write_start(file, &Mp4Config {
+                major_brand: str::parse("mp42").unwrap(),
+                minor_version: 0,
+                compatible_brands: vec![],
+                timescale: 90_000,
+            });
 
-            let mut frame_num = 0;
+            use std::io::Write;
+            file.write_all(encoder.headers().unwrap().entirety()).unwrap();
+
+            let mut frame_num: i64 = 0;
+            let frame_rate = frame_rate as i64;
             loop {
                 let rgba_buf = match receiver.recv() {
                     Ok(buf) => buf,
                     Err(_) => break
                 };
 
-                let image = x264::Image::bgra(size_i.0, size_i.1, rgba_buf);
-                let (data, _) = encoder.encoder(0, image).unwrap();
-                file.write_all(data.entirety());
+                // 90kHz resolution
+                let timestamp = frame_num * 90_000 / frame_rate;
+                //let timestamp = frame_num * 60;
+
+                let image = x264::Image::bgra(size_i.0, size_i.1, &rgba_buf);
+                let (data, _) = encoder.encode(timestamp, image).unwrap();
+                file.write_all(data.entirety()).unwrap();
+                frame_num += 1;
             }
 
-            file.flush();
+            let mut flush = encoder.flush();
+            while let Some(result) = flush.next() {
+                let (data, _) = result.unwrap();
+                file.write_all(data.entirety()).unwrap();
+            }
+
+            file.flush().unwrap();
         });
 
         for _ in 0..frame_count {
@@ -431,6 +449,7 @@ impl Ctx {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -966,13 +985,15 @@ impl Texture {
         }
     }
 
-    /// texture format must be Rgba8Unorm or Bgra8Unorm.
+    /// texture format must be Rgba8Unorm or Bgra8Unorm, or their srgb variants.
     pub fn read(&self, ctx: &Ctx, sender: std::sync::mpsc::Sender<Vec<u8>>) {
         let width = self.texture.width();
         let height = self.texture.height();
 
         let format = self.texture.format();
-        assert!(format == wgpu::TextureFormat::Bgra8Unorm || format == wgpu::TextureFormat::Rgba8Unorm);
+        assert!(format == wgpu::TextureFormat::Bgra8Unorm 
+                || format == wgpu::TextureFormat::Bgra8UnormSrgb 
+                || format == wgpu::TextureFormat::Rgba8Unorm);
 
         let bytes_per_row_packed = width * 4;
         let bytes_per_row_texture = if bytes_per_row_packed & 255 != 0 {

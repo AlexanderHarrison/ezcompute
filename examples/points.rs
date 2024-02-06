@@ -56,8 +56,10 @@ fn main() {
         dispatch_count: [(W+15)/16, (H+15)/16, 1],
     }).unwrap();
 
+    let copy_bind_group = ctx.create_copy_source_bind_group(&screen_texture);
+
     ctx.record(
-        "video.mkv",
+        "video.mp4",
         (W, H),
         300,
         60,
@@ -72,11 +74,13 @@ fn main() {
                 ctx.run_compute_pipeline(&mut pass, &field_creation_pipeline);
             }
 
-            encoder.copy_texture_to_texture(
-                screen_texture.texture.as_image_copy(),
-                output_texture.texture.as_image_copy(),
-                screen_texture.texture.size(),
-            );
+            ctx.copy_texture_to_texture(&mut encoder, &copy_bind_group, &output_texture.view, wgpu::Color::BLACK);
+
+            //encoder.copy_texture_to_texture(
+            //    screen_texture.texture.as_image_copy(),
+            //    output_texture.texture.as_image_copy(),
+            //    screen_texture.texture.size(),
+            //);
 
             ctx.queue.submit(std::iter::once(encoder.finish()));
         }
