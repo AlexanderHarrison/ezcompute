@@ -1,201 +1,11 @@
 use winit::{
-    event_loop::{EventLoop, EventLoopBuilder},
+    event_loop::EventLoopBuilder,
     window::WindowBuilder,
 };
 
 use wgpu::util::DeviceExt;
 
-struct Update;
-
-#[derive(Debug)]
-pub struct Window {
-    surface: wgpu::Surface<'static>,
-    handle: &'static winit::window::Window,
-    surface_config: wgpu::SurfaceConfiguration,
-    event_loop: EventLoop<Update>,
-}
-
-#[derive(Debug, Copy, Clone)]
-pub enum WindowEvent<'a> { 
-    Redraw {
-        window: &'static winit::window::Window,
-        surface: &'a wgpu::Surface<'static>,
-    },
-    Update {
-        delta: f32,
-        keys: &'a [KeyEvent],
-    }, 
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum WindowTask { Redraw, Exit, }
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum KeyState {
-    JustPressed,
-    Held,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyEvent {
-    pub key: winit::keyboard::Key,
-    pub state: KeyState,
-    queued_release: bool,
-}
-
-impl<'a> std::cmp::PartialEq<(&'a str, KeyState)> for KeyEvent {
-    fn eq<'b>(&'b self, other: &'b (&'a str, KeyState)) -> bool {
-        let (key_rhs, state_rhs) = other;
-
-        match self {
-            KeyEvent { 
-                key: winit::keyboard::Key::Character(key_lhs), 
-                state: state_lhs,
-                .. 
-            } => state_lhs == state_rhs && key_lhs == key_rhs,
-            KeyEvent { 
-                key: winit::keyboard::Key::Named(key_lhs), 
-                state: state_lhs,
-                .. 
-            } => state_lhs == state_rhs && key_lhs.to_text() == Some(key_rhs),
-            _ => false,
-        }
-    }
-}
-
-impl<'a> std::cmp::PartialEq<(winit::keyboard::NamedKey, KeyState)> for KeyEvent {
-    fn eq<'b>(&'b self, other: &'b (winit::keyboard::NamedKey, KeyState)) -> bool {
-        let (key_rhs, state_rhs) = other;
-
-        match self {
-            KeyEvent { 
-                key: winit::keyboard::Key::Named(key_lhs), 
-                state: state_lhs,
-                .. 
-            } => state_lhs == state_rhs && key_lhs == key_rhs,
-            _ => false,
-        }
-    }
-}
-
-impl Window {
-    pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
-
-    pub fn new(ctx: &Ctx, size: (u32, u32)) -> Self {
-        let event_loop = EventLoopBuilder::with_user_event().build().unwrap();
-
-        let window = WindowBuilder::new()
-            .with_min_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
-            .with_max_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
-            .build(&event_loop).unwrap();
-
-        let window: &'static _ = ctx.alloc.alloc(window);
-        let surface = ctx.instance.create_surface(window).unwrap();
-        let size = window.inner_size();
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: Self::TEXTURE_FORMAT,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            desired_maximum_frame_latency: 2,
-            view_formats: vec![],
-        };
-        surface.configure(&ctx.device, &surface_config);
-
-        Window { handle: window, surface, event_loop, surface_config }
-    }
-
-    pub fn run<F: FnMut(WindowEvent) -> Option<WindowTask>>(self, ctx: &Ctx, updates_per_second: f64, mut f: F) {
-        let Self { handle, mut surface_config, surface, event_loop } = self;
-        
-        let update_period = std::time::Duration::from_secs_f64(updates_per_second.recip());
-        let event_sender = event_loop.create_proxy();
-        std::thread::spawn(move || {
-            loop {
-                let _ = event_sender.send_event(Update);
-                std::thread::sleep(update_period);
-            }
-        });
-
-        let mut keys: Vec<KeyEvent> = Vec::with_capacity(16);
-
-        let mut prev_update_instant = None;
-        event_loop.run(move |event, window_target| match event {
-            winit::event::Event::UserEvent(Update) => {
-                let now = std::time::Instant::now();
-                let delta = match prev_update_instant {
-                    Some(i) => {
-                        let diff: std::time::Duration = now - i;
-                        diff.as_secs_f32()
-                    }
-                    None => update_period.as_secs_f32(),
-                };
-                prev_update_instant = Some(now);
-
-                match (f)(WindowEvent::Update { delta, keys: keys.as_slice() }) {
-                    Some(WindowTask::Redraw) => handle.request_redraw(),
-                    Some(WindowTask::Exit) => window_target.exit(),
-                    None => (),
-                }
-
-                keys.retain_mut(|k| {
-                    k.state = KeyState::Held;
-                    !k.queued_release
-                });
-            },
-            winit::event::Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == handle.id() => match event {
-                winit::event::WindowEvent::RedrawRequested => {
-                    match (f)(WindowEvent::Redraw { window: handle, surface: &surface }) {
-                        Some(WindowTask::Redraw) => handle.request_redraw(),
-                        Some(WindowTask::Exit) => window_target.exit(),
-                        None => (),
-                    }
-                },
-                winit::event::WindowEvent::Resized(new_size) => {
-                    surface_config.width = new_size.width;
-                    surface_config.height = new_size.height;
-                    surface.configure(&ctx.device, &surface_config);
-                },
-                winit::event::WindowEvent::KeyboardInput {
-                    event: winit::event::KeyEvent { state: winit::event::ElementState::Pressed, logical_key, .. },
-                    ..
-                } => {
-                    // occurs during repeat presses
-                    if keys.iter().any(|k| k.key == *logical_key) { return };
-
-                    keys.push(KeyEvent { key: logical_key.clone(), state: KeyState::JustPressed, queued_release: false })
-                },
-                winit::event::WindowEvent::KeyboardInput {
-                    event: winit::event::KeyEvent { state: winit::event::ElementState::Released, logical_key, .. },
-                    ..
-                } => {
-                    keys.retain_mut(|k| {
-                        if k.key != *logical_key {
-                            true
-                        } else {
-                            match k.state {
-                                KeyState::Held => false,
-                                KeyState::JustPressed => {
-                                    k.queued_release = true;
-                                    true
-                                }
-                            }
-                        }
-                    });
-                }
-                winit::event::WindowEvent::CloseRequested => window_target.exit(),
-                _ => (),
-            },
-            _ => (),
-        }).expect("error running event loop")
-    }
-}
+pub const SURFACE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -203,9 +13,10 @@ pub struct Ctx {
     pub queue: wgpu::Queue,
     pub instance: wgpu::Instance,
 
-    pub copy_pipeline: wgpu::RenderPipeline,
+    pub copy_pipeline_layout: wgpu::PipelineLayout,
     pub copy_bind_group_layout: wgpu::BindGroupLayout,
     pub copy_sampler: wgpu::Sampler,
+    pub copy_shader: wgpu::ShaderModule,
 
     pub alloc: &'static bumpalo::Bump,
 }
@@ -224,7 +35,8 @@ impl Ctx {
             flags: Default::default(),
         });
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::CLEAR_TEXTURE
                     | wgpu::Features:: TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
@@ -260,142 +72,337 @@ impl Ctx {
             ],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let copy_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&copy_bind_group_layout],
             push_constant_ranges: &[],
-        });
-
-        let copy_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &copy_shader,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &copy_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: Window::TEXTURE_FORMAT,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
         });
 
         let copy_sampler = device.create_sampler(&Default::default());
 
         Self {
             device, queue, instance,
-            copy_pipeline, copy_bind_group_layout, copy_sampler,
+            copy_pipeline_layout, copy_bind_group_layout, copy_sampler, copy_shader,
             alloc: Box::leak(Box::new(bumpalo::Bump::new())),
         }
     }
 
-    pub fn record<F>(
-        &self, 
-        output: &'static str, 
-        size: (u32, u32), 
-        frame_count: u32, 
-        frame_rate: u32,
-        mut f: F
-    ) where
-        F: FnMut(&Texture)
+    pub fn run<F>(&self, size: (u32, u32), updates_per_second: u32, mut f: F) where
+        F: FnMut(WindowEvent) -> Option<WindowTask>
     {
-        let texture = self.create_texture(size, wgpu::TextureFormat::Bgra8UnormSrgb);
-        let size = (size.0 as usize, size.1 as usize);
-        let size_i = (size.0 as i32, size.1 as i32);
+        let event_loop = EventLoopBuilder::with_user_event().build().unwrap();
 
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let window = WindowBuilder::new()
+            .with_min_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
+            .with_max_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
+            .build(&event_loop).unwrap();
 
-        let write_thread = std::thread::spawn(move || {
-            let mut file = std::io::BufWriter::new(std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(std::path::Path::new(output))
-                .expect("could not open or create file"));
+        let window: &'static _ = self.alloc.alloc(window);
+        let surface = self.instance.create_surface(window).unwrap();
+        let size = window.inner_size();
 
-            let mut encoder = x264::Setup::preset(x264::Preset::Veryslow, x264::Tune::None, false, false)
-                .timebase(1, 90_000)
-                .fps(frame_rate, 1)
-                .annexb(false)
-                .build(x264::Colorspace::BGRA, size_i.0, size_i.1)
-                .unwrap();
+        let mut surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: SURFACE_TEXTURE_FORMAT,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            desired_maximum_frame_latency: 2,
+            view_formats: vec![],
+        };
+        surface.configure(&self.device, &surface_config);
 
-            let mp4_writer = mp4::Mp4Writer::write_start(file, &Mp4Config {
-                major_brand: str::parse("mp42").unwrap(),
-                minor_version: 0,
-                compatible_brands: vec![],
-                timescale: 90_000,
-            });
-
-            use std::io::Write;
-            file.write_all(encoder.headers().unwrap().entirety()).unwrap();
-
-            let mut frame_num: i64 = 0;
-            let frame_rate = frame_rate as i64;
+        let update_period = std::time::Duration::from_secs_f64((updates_per_second as f64 * 1.0).recip());
+        let event_sender = event_loop.create_proxy();
+        std::thread::spawn(move || {
             loop {
-                let rgba_buf = match receiver.recv() {
-                    Ok(buf) => buf,
-                    Err(_) => break
-                };
-
-                // 90kHz resolution
-                let timestamp = frame_num * 90_000 / frame_rate;
-                //let timestamp = frame_num * 60;
-
-                let image = x264::Image::bgra(size_i.0, size_i.1, &rgba_buf);
-                let (data, _) = encoder.encode(timestamp, image).unwrap();
-                file.write_all(data.entirety()).unwrap();
-                frame_num += 1;
+                let _ = event_sender.send_event(Update);
+                std::thread::sleep(update_period);
             }
-
-            let mut flush = encoder.flush();
-            while let Some(result) = flush.next() {
-                let (data, _) = result.unwrap();
-                file.write_all(data.entirety()).unwrap();
-            }
-
-            file.flush().unwrap();
         });
 
-        for _ in 0..frame_count {
-            (f)(&texture);
-            texture.read(self, sender.clone());
-        }
-        std::mem::drop(sender);
+        let mut keys: Vec<KeyEvent> = Vec::with_capacity(16);
 
-        write_thread.join().unwrap();
+        let mut prev_update_instant = None;
+
+        let depth_texture_desc = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+
+        let depth_texture = self.device.create_texture(&depth_texture_desc);
+        let depth_view = depth_texture.create_view(&Default::default());
+
+        let null_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            ..depth_texture_desc
+        });
+        let null_view = null_texture.create_view(&Default::default());
+
+        // messy, but it works
+        let mut output = RenderTexture {
+            texture: null_texture,
+            view: null_view,
+            depth_texture,
+            depth_view,
+        };
+
+        event_loop.run(move |event, window_target| match event {
+            winit::event::Event::UserEvent(Update) => {
+                let now = std::time::Instant::now();
+                let delta = match prev_update_instant {
+                    Some(i) => {
+                        let diff: std::time::Duration = now - i;
+                        diff.as_secs_f32()
+                    }
+                    None => update_period.as_secs_f32(),
+                };
+                prev_update_instant = Some(now);
+
+                let events = KeyEvents { events: keys.as_slice() };
+                match (f)(WindowEvent::Update { delta, keys: events }) {
+                    Some(WindowTask::Redraw) => window.request_redraw(),
+                    Some(WindowTask::Exit) => window_target.exit(),
+                    None => (),
+                }
+
+                keys.retain_mut(|k| {
+                    k.state = KeyState::Held;
+                    !k.queued_release
+                });
+            },
+            winit::event::Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == window.id() => match event {
+                winit::event::WindowEvent::RedrawRequested => {
+                    let mut surface_texture = match surface.get_current_texture() {
+                        Ok(s) => s,
+                        Err(wgpu::SurfaceError::Timeout) => return,
+                        Err(e) => panic!("{}", e),
+                    };
+
+                    let surface_size = surface_texture.texture.size();
+                    if surface_size != output.depth_texture.size() {
+                        output.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            size: surface_size,
+                            ..depth_texture_desc
+                        });
+                        output.depth_view = output.depth_texture.create_view(&Default::default())
+                    }
+
+                    take_mut::take(&mut surface_texture.texture, |texture| {
+                        let view = texture.create_view(&Default::default());
+                        let null_texture = std::mem::replace(&mut output.texture, texture);
+                        let null_view = std::mem::replace(&mut output.view, view);
+                        match (f)(WindowEvent::Redraw { output: &output }) {
+                            Some(WindowTask::Redraw) => window.request_redraw(),
+                            Some(WindowTask::Exit) => window_target.exit(),
+                            None => (),
+                        };
+
+                        let texture = std::mem::replace(&mut output.texture, null_texture);
+                        output.view = null_view;
+                        texture
+                    });
+                    window.pre_present_notify();
+                    surface_texture.present();
+                },
+                winit::event::WindowEvent::Resized(new_size) => {
+                    surface_config.width = new_size.width;
+                    surface_config.height = new_size.height;
+                    surface.configure(&self.device, &surface_config);
+                },
+                winit::event::WindowEvent::KeyboardInput {
+                    event: winit::event::KeyEvent { 
+                        state: winit::event::ElementState::Pressed, 
+                        physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
+                        .. 
+                    },
+                    ..
+                } => {
+                    // occurs during repeat presses
+                    if keys.iter().any(|k| k.key == *physical_key) { return };
+
+                    keys.push(KeyEvent { key: *physical_key, state: KeyState::JustPressed, queued_release: false })
+                },
+                winit::event::WindowEvent::KeyboardInput {
+                    event: winit::event::KeyEvent { 
+                        state: winit::event::ElementState::Released, 
+                        physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
+                        .. 
+                    },
+                    ..
+                } => {
+                    keys.retain_mut(|k| {
+                        if k.key != *physical_key {
+                            true
+                        } else {
+                            match k.state {
+                                KeyState::Held => false,
+                                KeyState::JustPressed => {
+                                    k.queued_release = true;
+                                    true
+                                }
+                            }
+                        }
+                    });
+                }
+                winit::event::WindowEvent::CloseRequested => window_target.exit(),
+                _ => (),
+            },
+            _ => (),
+        }).expect("error running event loop")
     }
+
+    //pub fn record<F>(
+    //    &self, 
+    //    output: &'static str, 
+    //    size: (u32, u32), 
+    //    frame_count: u32, 
+    //    frame_rate: u32,
+    //    mut f: F
+    //) where
+    //    F: FnMut(&Texture)
+    //{
+    //    let texture = self.create_texture(size, wgpu::TextureFormat::Bgra8UnormSrgb);
+    //    let size = (size.0 as usize, size.1 as usize);
+    //    let size_i = (size.0 as i32, size.1 as i32);
+
+    //    let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    //    let write_thread = std::thread::spawn(move || {
+    //        let mut file = std::io::BufWriter::new(std::fs::OpenOptions::new()
+    //            .create(true)
+    //            .write(true)
+    //            .open(std::path::Path::new(output))
+    //            .expect("could not open or create file"));
+
+    //        let mut encoder = x264::Setup::high()
+    //            .timebase(1, 90_000)
+    //            .fps(frame_rate, 1)
+    //            .annexb(false)
+    //            .build(x264::Colorspace::BGRA, size_i.0, size_i.1)
+    //            .unwrap();
+
+    //        let mut mp4_writer = mp4::Mp4Writer::write_start(file, &Mp4Config {
+    //            major_brand: str::parse("mp42").unwrap(),
+    //            minor_version: 0,
+    //            compatible_brands: vec![],
+    //            timescale: 90_000,
+    //        });
+    //        
+    //        mp4_writer.add_track(&mp4::TrackConfig {
+    //            track_type: mpv::TrackType::Video,
+    //            timescale: 90_000,
+    //            language: String::new(),
+    //            media_conf: mp4::MediaConfig::AvcConfig(mp4::AvcConfig {
+    //                width: size.0 as _,
+    //                height: size.1 as _,
+
+    //            })
+    //        });
+
+    //        use std::io::Write;
+    //        file.write_all(encoder.headers().unwrap().entirety()).unwrap();
+
+    //        let mut frame_num: i64 = 0;
+    //        let frame_rate = frame_rate as i64;
+    //        loop {
+    //            let rgba_buf = match receiver.recv() {
+    //                Ok(buf) => buf,
+    //                Err(_) => break
+    //            };
+
+    //            // 90kHz resolution
+    //            let timestamp = frame_num * 90_000 / frame_rate;
+    //            //let timestamp = frame_num * 60;
+
+    //            let image = x264::Image::bgra(size_i.0, size_i.1, &rgba_buf);
+    //            let (data, _) = encoder.encode(timestamp, image).unwrap();
+    //            file.write_all(data.entirety()).unwrap();
+    //            frame_num += 1;
+    //        }
+
+    //        let mut flush = encoder.flush();
+    //        while let Some(result) = flush.next() {
+    //            let (data, _) = result.unwrap();
+    //            file.write_all(data.entirety()).unwrap();
+    //        }
+
+    //        file.flush().unwrap();
+    //    });
+
+    //    for _ in 0..frame_count {
+    //        (f)(&texture);
+    //        texture.read(self, sender.clone());
+    //    }
+    //    std::mem::drop(sender);
+
+    //    write_thread.join().unwrap();
+    //}
 
     pub fn create_vertex_buffer<T: bytemuck::NoUninit>(
         &self, 
-        vertices: &[T],
-        attributes: &[wgpu::VertexAttribute],
+        desc: VertexBufferDescriptor<'_, T>,
     ) -> VertexBuffer {
-        let attributes: &'static [wgpu::VertexAttribute] = self.alloc.alloc_slice_copy(attributes);
-
+        let attributes: &'static [wgpu::VertexAttribute] = self.alloc.alloc_slice_copy(desc.attributes);
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<T>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes,
         };
 
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(vertices),
+            contents: bytemuck::cast_slice(desc.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let vertex_count = vertices.len() as u32;
+        let index_buffer = match desc.index_buffer {
+            Some(IndexBufferData::Uint16(data)) => {
+                let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                Some(IndexBuffer {
+                    format: wgpu::IndexFormat::Uint16,
+                    buffer,
+                    index_count: data.len() as u32,
+                })
+            },
+            Some(IndexBufferData::Uint32(data)) => {
+                let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                Some(IndexBuffer {
+                    format: wgpu::IndexFormat::Uint32,
+                    buffer,
+                    index_count: data.len() as u32,
+                })
+            },
+            None => None,
+        };
 
-        VertexBuffer { buffer, vertex_layout, vertex_count }
+        let vertex_count = desc.vertices.len() as u32;
+
+        VertexBuffer { 
+            vertex_buffer, 
+            vertex_layout, 
+            vertex_count,
+            index_buffer,
+            primitives: desc.primitives,
+        }
     }
 
     pub fn create_storage_buffer<T: bytemuck::NoUninit>(&self, data: &[T]) -> StorageBuffer {
@@ -409,6 +416,7 @@ impl Ctx {
 
         StorageBuffer { buffer, layout }
     }
+
 
     pub fn create_uniform<T: bytemuck::NoUninit>(&self, data: &T) -> Uniform {
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -430,11 +438,43 @@ impl Ctx {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::STORAGE_BINDING 
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let view = texture.create_view(&Default::default());
+
+        Texture { texture, view }
+    }
+
+    /// texture format for storage texture must be rgba8unorm
+    pub fn create_storage_texture_with_data<T: bytemuck::NoUninit>(
+        &self,
+        size: (u32, u32), 
+        format: wgpu::TextureFormat,
+        data: &[T]
+    ) -> Texture {
+        let texture = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING 
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(data),
+        );
         let view = texture.create_view(&Default::default());
 
         Texture { texture, view }
@@ -449,7 +489,6 @@ impl Ctx {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -459,31 +498,208 @@ impl Ctx {
         Texture { texture, view }
     }
 
-    pub fn create_render_pipeline(
+    pub fn create_render_texture(&self, size: (u32, u32), format: wgpu::TextureFormat) -> RenderTexture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&Default::default());
+
+        RenderTexture { texture, view, depth_texture, depth_view }
+    }
+
+    pub fn create_texture_copier<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
+        let source_format = src.texture.format();
+        let target_format = dst.texture.format();
+
+        let formats_match = source_format.remove_srgb_suffix() == target_format.remove_srgb_suffix();
+        let dims_match = src.texture.dimension() == dst.texture.dimension();
+        let size_match = src.texture.size() == dst.texture.size();
+        
+        if formats_match && dims_match && size_match {
+            TextureCopier::Fast { src, dst }
+        } else {
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&self.copy_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &self.copy_shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.copy_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        //blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(), // tri list
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.copy_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&src.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
+                    },
+                ],
+            });
+
+            TextureCopier::Slow { pipeline, bind_group, dst }
+        }
+    }
+
+    pub fn create_texture_copier_transparent<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&self.copy_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &self.copy_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.copy_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: dst.texture.format(),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(), // tri list
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.copy_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
+                },
+            ],
+        });
+
+        TextureCopier::Transparent { pipeline, bind_group, dst }
+    }
+
+    pub fn create_screen_copier<'a>(&self, src: &'a Texture) -> ScreenCopier {
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&self.copy_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &self.copy_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.copy_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SURFACE_TEXTURE_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(), // tri list
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.copy_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
+                },
+            ],
+        });
+
+        ScreenCopier { pipeline, bind_group }
+    }
+
+    pub fn create_render_pipeline<'a, 'b>(
         &self, 
-        desc: RenderPipelineDescriptor<'_>
-    ) -> Result<RenderPipeline, PipelineCreationError> {
-        let vertex_count = desc.vertex_buffer.vertex_count;
+        desc: RenderPipelineDescriptor<'a, 'b>
+    ) -> Result<RenderPipeline<'a>, PipelineCreationError> {
+        let draw_range = if let Some(ref ib) = desc.vertex_buffer.index_buffer {
+            0..ib.index_count
+        } else {
+            0..desc.vertex_buffer.vertex_count
+        };
+
         self.create_render_pipeline_ex(RenderPipelineDescriptorEx {
             inputs: desc.inputs,
-            vertex_buffer: Some(desc.vertex_buffer),
+            vertex_buffer: Either::A(desc.vertex_buffer),
             shader_file: desc.shader_file,
             shader_vertex_entry: desc.shader_vertex_entry,
             shader_fragment_entry: desc.shader_fragment_entry,
             output_format: desc.output_format,
-            primitive: wgpu::PrimitiveTopology::TriangleList,
-            vertex_count,
+            primitives: desc.vertex_buffer.primitives,
+            draw_range,
             blend_state: None,
-            instance_count: 1,
+            instance_range: 0..1,
         })
     }
 
-    pub fn create_render_pipeline_ex(
+    pub fn create_render_pipeline_ex<'a, 'b>(
         &self, 
-        render_pipeline_desc: RenderPipelineDescriptorEx<'_>
-    ) -> Result<RenderPipeline, PipelineCreationError> {
+        desc: RenderPipelineDescriptorEx<'a, 'b>
+    ) -> Result<RenderPipeline<'a>, PipelineCreationError> {
         let bind_group_layout_entries: &'static [wgpu::BindGroupLayoutEntry] = self.alloc.alloc_slice_fill_iter({
-            render_pipeline_desc.inputs.iter()
+            desc.inputs.iter()
                 .enumerate()
                 .map(|(i, input): (usize, &PipelineInput)| {
                     wgpu::BindGroupLayoutEntry {
@@ -501,7 +717,7 @@ impl Ctx {
         });
 
         let bind_group_entries: &[wgpu::BindGroupEntry] = self.alloc.alloc_slice_fill_iter({
-            render_pipeline_desc.inputs.iter()
+            desc.inputs.iter()
                 .enumerate()
                 .map(|(i, input): (usize, &PipelineInput)| {
                     wgpu::BindGroupEntry {
@@ -517,15 +733,17 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader_source = std::fs::read_to_string(render_pipeline_desc.shader_file)
+        let shader_source = std::fs::read_to_string(desc.shader_file)
             .map_err(|_| PipelineCreationError::ShaderFileDoesNotExist)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_source)),
         });
 
-        let vb_layout = render_pipeline_desc.vertex_buffer.as_ref()
-            .map(|vbo| vbo.vertex_layout.clone());
+        let (vertex_buffer, primitives, vb_layout) = match desc.vertex_buffer {
+            Either::A(vbo) => (Some(vbo), vbo.primitives, Some(vbo.vertex_layout.clone())),
+            Either::B(primitives) => (None, primitives, None),
+        };
 
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -536,50 +754,56 @@ impl Ctx {
             })),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: render_pipeline_desc.shader_vertex_entry,
+                entry_point: desc.shader_vertex_entry,
                 buffers: vb_layout.as_slice(),
             },
             primitive: wgpu::PrimitiveState {
-                topology: render_pipeline_desc.primitive,
+                topology: primitives,
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                //count: desc.multisample_count,
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: render_pipeline_desc.shader_fragment_entry,
+                entry_point: desc.shader_fragment_entry,
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: render_pipeline_desc.output_format,
-                    blend: render_pipeline_desc.blend_state,
+                    format: desc.output_format,
+                    blend: desc.blend_state,
                     write_mask: wgpu::ColorWrites::ALL,
                 })]
             }),
             multiview: None,
         });
 
-        let vertex_count = render_pipeline_desc.vertex_count;
-        let instance_count = render_pipeline_desc.instance_count;
-
         Ok(RenderPipeline {
             wgpu_pipeline: pipeline,
             shader,
             bind_group: bind_group,
             bind_group_layout: bind_group_layout,
-            vertex_buffer: render_pipeline_desc.vertex_buffer,
-            instance_count,
-            vertex_count,
+            vertex_buffer,
+            instance_range: desc.instance_range,
+            draw_range: desc.draw_range,
         })
     }
 
     pub fn create_compute_pipeline(
         &self, 
-        compute_pipeline_desc: ComputePipelineDescriptor<'_>
+        desc: ComputePipelineDescriptor<'_>
     ) -> Result<ComputePipeline, PipelineCreationError> {
-        let input_count = compute_pipeline_desc.inputs.len();
+        let input_count = desc.inputs.len();
         let bind_group_layout_entries: &'static [wgpu::BindGroupLayoutEntry] = self.alloc.alloc_slice_fill_iter(
             CustomChain::new(
-                compute_pipeline_desc.inputs.iter()
+                desc.inputs.iter()
                     .enumerate()
                     .map(|(i, input): (usize, &PipelineInput)|
                         wgpu::BindGroupLayoutEntry {
@@ -589,7 +813,7 @@ impl Ctx {
                             ty: input.binding_type(),
                         }
                     ),
-                compute_pipeline_desc.outputs.iter()
+                desc.outputs.iter()
                     .enumerate()
                     .map(|(i, output): (usize, &ComputePipelineOutput)|
                         wgpu::BindGroupLayoutEntry {
@@ -609,7 +833,7 @@ impl Ctx {
 
         let bind_group_entries: &[wgpu::BindGroupEntry] = self.alloc.alloc_slice_fill_iter(
             CustomChain::new(
-                compute_pipeline_desc.inputs.iter()
+                desc.inputs.iter()
                     .enumerate()
                     .map(|(i, input): (usize, &PipelineInput)| 
                         wgpu::BindGroupEntry {
@@ -617,7 +841,7 @@ impl Ctx {
                             resource: input.binding_resource(),
                         }
                     ),
-                compute_pipeline_desc.outputs.iter()
+                desc.outputs.iter()
                     .enumerate()
                     .map(|(i, output): (usize, &ComputePipelineOutput)|
                         wgpu::BindGroupEntry {
@@ -634,7 +858,7 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader_source = std::fs::read_to_string(compute_pipeline_desc.shader_file)
+        let shader_source = std::fs::read_to_string(desc.shader_file)
             .map_err(|_| PipelineCreationError::ShaderFileDoesNotExist)?;
 
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -650,7 +874,7 @@ impl Ctx {
                 push_constant_ranges: &[],
             })),
             module: &shader,
-            entry_point: compute_pipeline_desc.shader_entry,
+            entry_point: desc.shader_entry,
         });
 
         Ok(ComputePipeline {
@@ -658,42 +882,27 @@ impl Ctx {
             shader,
             bind_group,
             bind_group_layout,
-            dispatch_count: compute_pipeline_desc.dispatch_count,
-        })
-    }
-
-    pub fn start_render_pass<'a>(
-        &self, 
-        encoder: &'a mut wgpu::CommandEncoder,
-        clear_colour: Option<wgpu::Color>,
-        output_view: &'a wgpu::TextureView,
-    ) -> wgpu::RenderPass<'a> {
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: output_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: match clear_colour {
-                        Some(c) => wgpu::LoadOp::Clear(c),
-                        None => wgpu::LoadOp::Load,
-                    },
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
+            dispatch_count: desc.dispatch_count,
         })
     }
 
     pub fn run_render_pipeline<'a>(&self, pass: &mut wgpu::RenderPass<'a>, pipeline: &'a RenderPipeline) {
         pass.set_pipeline(&pipeline.wgpu_pipeline);
         pass.set_bind_group(0, &pipeline.bind_group, &[]);
-        if let Some(ref vbo) = pipeline.vertex_buffer {
-            pass.set_vertex_buffer(0, vbo.buffer.slice(..));
+        let draw_range = pipeline.draw_range.clone();
+        let instance_range = pipeline.instance_range.clone();
+        if let Some(v) = pipeline.vertex_buffer {
+            pass.set_vertex_buffer(0, v.vertex_buffer.slice(..));
+
+            if let Some(ref ib) = v.index_buffer {
+                pass.set_index_buffer(ib.buffer.slice(..), ib.format);
+                pass.draw_indexed(draw_range, 0, instance_range);
+             } else {
+                pass.draw(draw_range, instance_range);
+             }
+        } else {
+            pass.draw(draw_range, instance_range);
         }
-        pass.draw(0..pipeline.vertex_count, 0..pipeline.instance_count);
     }
 
     pub fn run_compute_pipeline<'a>(&self, pass: &mut wgpu::ComputePass<'a>, pipeline: &'a ComputePipeline) {
@@ -703,21 +912,49 @@ impl Ctx {
         pass.dispatch_workgroups(x, y, z);
     }
 
-    pub fn create_copy_source_bind_group(&self, source: &Texture) -> wgpu::BindGroup {
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    pub fn run_render_pass(
+        &self, 
+        encoder: &mut wgpu::CommandEncoder,
+        output: &RenderTexture,
+        clear_colour: wgpu::Color, 
+        passes: &[&RenderPipeline]
+    ) {
+        let desc = wgpu::RenderPassDescriptor {
             label: None,
-            layout: &self.copy_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source.view),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &output.view,
+                resolve_target: None,
+                    ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_colour),
+                    store: wgpu::StoreOp::Store,
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
-                },
-            ],
-        })
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &output.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        };
+        let mut pass = encoder.begin_render_pass(&desc);
+        for pipeline in passes {
+            self.run_render_pipeline(&mut pass, pipeline);
+        }
+    }
+
+    pub fn run_compute_pass(
+        &self, 
+        encoder: &mut wgpu::CommandEncoder,
+        passes: &[&ComputePipeline]
+    ) {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        for pipeline in passes {
+            self.run_compute_pipeline(&mut pass, pipeline);
+        }
     }
 
     pub fn clear_texture(
@@ -731,38 +968,26 @@ impl Ctx {
     pub fn copy_buffer_to_buffer(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        source: &StorageBuffer,
-        dest: &StorageBuffer
+        src: &StorageBuffer,
+        dst: &StorageBuffer
     ) {
-        assert!(source.layout == dest.layout);
-        encoder.copy_buffer_to_buffer(&source.buffer, 0, &dest.buffer, 0, source.buffer.size());
+        assert!(src.layout == dst.layout);
+        encoder.copy_buffer_to_buffer(&src.buffer, 0, &dst.buffer, 0, src.buffer.size());
     }
 
     pub fn copy_texture_to_screen(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        copy_source_bind_group: &wgpu::BindGroup,
-        surface: &wgpu::SurfaceTexture,
-        background_colour: wgpu::Color,
-    ) {
-        let surface_view = surface.texture.create_view(&Default::default());
-        self.copy_texture_to_texture(encoder, copy_source_bind_group, &surface_view, background_colour);
-    }
-
-    pub fn copy_texture_to_texture(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        copy_source_bind_group: &wgpu::BindGroup,
-        target_texture_view: &wgpu::TextureView,
-        background_colour: wgpu::Color,
+        copier: &ScreenCopier,
+        output: &Texture,
     ) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_texture_view,
+                view: &output.view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(background_colour),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -770,9 +995,63 @@ impl Ctx {
             occlusion_query_set: None,
             timestamp_writes: None,
         });
-        rpass.set_pipeline(&self.copy_pipeline);
-        rpass.set_bind_group(0, &copy_source_bind_group, &[]);
+        rpass.set_pipeline(&copier.pipeline);
+        rpass.set_bind_group(0, &copier.bind_group, &[]);
         rpass.draw(0..3, 0..2);
+    }
+
+    pub fn copy_texture_to_texture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        copier: &TextureCopier,
+    ) {
+        match copier {
+            TextureCopier::Fast { src, dst } => {
+                encoder.copy_texture_to_texture(
+                    src.texture.as_image_copy(),
+                    dst.texture.as_image_copy(),
+                    src.texture.size(),
+                )
+            },
+            TextureCopier::Slow { ref pipeline, ref bind_group, dst } => {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &dst.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                rpass.set_pipeline(pipeline);
+                rpass.set_bind_group(0, bind_group, &[]);
+                rpass.draw(0..3, 0..2);
+            },
+            TextureCopier::Transparent { ref pipeline, ref bind_group, dst } => {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &dst.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                rpass.set_pipeline(pipeline);
+                rpass.set_bind_group(0, bind_group, &[]);
+                rpass.draw(0..3, 0..2);
+            },
+        }
     }
 }
 
@@ -796,38 +1075,51 @@ pub struct ComputePipeline {
 }
 
 #[derive(Debug)]
-pub struct RenderPipelineDescriptor<'a> {
-    pub inputs: &'a [PipelineInput<'a>],
-    pub vertex_buffer: VertexBuffer,
-    pub shader_file: &'a std::path::Path,
+pub struct RenderPipelineDescriptor<'a, 'b> {
+    pub inputs: &'b [PipelineInput<'b>],
+    pub vertex_buffer: &'a VertexBuffer,
+    pub shader_file: &'b std::path::Path,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
 }
 
 #[derive(Debug)]
-pub struct RenderPipelineDescriptorEx<'a> {
-    pub inputs: &'a [PipelineInput<'a>],
-    pub vertex_buffer: Option<VertexBuffer>,
-    pub shader_file: &'a std::path::Path,
+pub enum Either<A, B> {
+    A(A),
+    B(B),
+}
+
+#[derive(Debug)]
+pub struct RenderPipelineDescriptorEx<'a, 'b> {
+    pub inputs: &'b [PipelineInput<'b>],
+    pub vertex_buffer: Either<&'a VertexBuffer, wgpu::PrimitiveTopology>,
+    pub shader_file: &'b std::path::Path,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
-    pub primitive: wgpu::PrimitiveTopology,
+    pub primitives: wgpu::PrimitiveTopology,
     pub blend_state: Option<wgpu::BlendState>,
-    pub instance_count: u32,
-    pub vertex_count: u32,
+
+    pub draw_range: std::ops::Range<u32>,
+    pub instance_range: std::ops::Range<u32>,
 }
 
 #[derive(Debug)]
-pub struct RenderPipeline {
+pub enum DepthBuffer {
+    NotCreated,
+    Created(Texture),
+}
+
+#[derive(Debug)]
+pub struct RenderPipeline<'a> {
     pub wgpu_pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
-    pub vertex_buffer: Option<VertexBuffer>,
+    pub vertex_buffer: Option<&'a VertexBuffer>,
     pub shader: wgpu::ShaderModule,
     pub bind_group_layout: wgpu::BindGroupLayout,
-    pub instance_count: u32,
-    pub vertex_count: u32,
+    pub draw_range: std::ops::Range<u32>,
+    pub instance_range: std::ops::Range<u32>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -922,6 +1214,30 @@ impl<'a> ComputePipelineOutput<'a> {
 }
 
 #[derive(Debug)]
+pub enum TextureCopier<'a> {
+    Fast {
+        src: &'a Texture,
+        dst: &'a Texture,
+    },
+    Slow {
+        pipeline: wgpu::RenderPipeline,
+        bind_group: wgpu::BindGroup,
+        dst: &'a Texture
+    },
+    Transparent {
+        pipeline: wgpu::RenderPipeline,
+        bind_group: wgpu::BindGroup,
+        dst: &'a Texture,
+    }
+}
+
+#[derive(Debug)]
+pub struct ScreenCopier {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group: wgpu::BindGroup,
+}
+
+#[derive(Debug)]
 pub struct Uniform {
     pub buffer: wgpu::Buffer,
     pub layout: std::alloc::Layout,
@@ -939,6 +1255,14 @@ pub struct Texture {
     pub view: wgpu::TextureView,
 }
 
+#[derive(Debug)]
+pub struct RenderTexture {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub depth_texture: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
+}
+
 impl Uniform {
     pub fn update<T: bytemuck::NoUninit>(&self, ctx: &Ctx, data: &T) {
         assert!(std::alloc::Layout::new::<T>() == self.layout);
@@ -951,13 +1275,56 @@ impl StorageBuffer {
         assert!(std::alloc::Layout::new::<T>() == self.layout);
         ctx.queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
     }
+
+    /// Returns the number of elements in the buffer, not the size in bytes.
+    pub fn len(&self) -> u32 {
+        (self.buffer.size() / self.layout.pad_to_align().size() as u64) as u32
+    }
+
+    pub fn dispatch_count(&self, workgroup_size: u32) -> [u32; 3] {
+        assert!(workgroup_size != 0);
+        [(self.len() + workgroup_size-1)/workgroup_size, 1, 1]
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum IndexBufferData<'a> {
+    Uint16(&'a [u16]),
+    Uint32(&'a [u32]),
+}
+
+impl<'a> IndexBufferData<'a> {
+    pub fn from_array_u16<const N: usize>(array: &'a [[u16; N]]) -> Self {
+        IndexBufferData::Uint16(bytemuck::cast_slice(array))
+    }
+
+    pub fn from_array_u32<const N: usize>(array: &'a [[u32; N]]) -> Self {
+        IndexBufferData::Uint32(bytemuck::cast_slice(array))
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct VertexBufferDescriptor<'a, T: bytemuck::NoUninit> {
+    pub vertices: &'a [T],
+    pub attributes: &'a [wgpu::VertexAttribute],
+    pub index_buffer: Option<IndexBufferData<'a>>,
+    pub primitives: wgpu::PrimitiveTopology,
+}
+
+#[derive(Debug)]
+pub struct IndexBuffer {
+    pub format: wgpu::IndexFormat,
+    pub buffer: wgpu::Buffer,
+    pub index_count: u32,
 }
 
 #[derive(Debug)]
 pub struct VertexBuffer {
-    pub buffer: wgpu::Buffer,
+    pub vertex_buffer: wgpu::Buffer,
     pub vertex_layout: wgpu::VertexBufferLayout<'static>,
     pub vertex_count: u32,
+    pub index_buffer: Option<IndexBuffer>,
+    pub primitives: wgpu::PrimitiveTopology,
 }
 
 impl Texture {
@@ -1068,6 +1435,60 @@ impl Texture {
         ctx.device.poll(wgpu::Maintain::Wait);
     }
 
+    pub fn dispatch_count(&self, workgroup_size: [u32; 2]) -> [u32; 3] {
+        let size = self.texture.size();
+        assert!(workgroup_size[0] != 0);
+        assert!(workgroup_size[1] != 0);
+        let w_width = workgroup_size[0];
+        let w_height = workgroup_size[1];
+        [(size.width + w_width-1)/w_width, (size.height + w_height-1)/w_height, 1]
+    }
+}
+
+struct Update;
+
+#[derive(Debug, Copy, Clone)]
+pub enum WindowEvent<'a> { 
+    Redraw {
+        output: &'a RenderTexture,
+    },
+    Update {
+        delta: f32,
+        keys: KeyEvents<'a>,
+    }, 
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum WindowTask { Redraw, Exit, }
+
+pub use winit::keyboard::KeyCode as Key;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum KeyState {
+    JustPressed,
+    Held,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub key: Key,
+    pub state: KeyState,
+    pub(crate) queued_release: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct KeyEvents<'a> {
+    pub events: &'a [KeyEvent],
+}
+
+impl<'a> KeyEvents<'a> {
+    pub fn just_pressed(&self, key: Key) -> bool {
+        self.events.iter().any(|event| event.key == key && event.state == KeyState::JustPressed)
+    }
+
+    pub fn down(&self, key: Key) -> bool {
+        self.events.iter().any(|event| event.key == key)
+    }
 }
 
 /// std Chain doesn't impl ExactSizeIterator >:(
