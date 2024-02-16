@@ -782,14 +782,14 @@ impl Ctx {
     pub fn create_render_pipeline<'a, 'b>(
         &self, 
         desc: RenderPipelineDescriptor<'a, 'b>
-    ) -> Result<RenderPipeline<'a>, PipelineCreationError> {
+    ) -> RenderPipeline<'a> {
         self.create_render_pipeline_ex(desc.into())
     }
 
     pub fn create_render_pipeline_ex<'a, 'b>(
         &self, 
         desc: RenderPipelineDescriptorEx<'a, 'b>
-    ) -> Result<RenderPipeline<'a>, PipelineCreationError> {
+    ) -> RenderPipeline<'a> {
         let bind_group_layout_entries: &'static [wgpu::BindGroupLayoutEntry] = self.alloc.alloc_slice_fill_iter({
             desc.inputs.iter()
                 .enumerate()
@@ -825,11 +825,9 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader_source = std::fs::read_to_string(desc.shader_file)
-            .map_err(|_| PipelineCreationError::ShaderFileDoesNotExist)?;
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_source)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(desc.shader)),
         });
 
         let (vertex_buffer, primitives, vb_layout) = match desc.vertex_buffer {
@@ -881,7 +879,7 @@ impl Ctx {
             multiview: None,
         });
 
-        Ok(RenderPipeline {
+        RenderPipeline {
             wgpu_pipeline: pipeline,
             shader,
             bind_group: bind_group,
@@ -889,13 +887,13 @@ impl Ctx {
             vertex_buffer,
             instance_range: desc.instance_range,
             draw_range: desc.draw_range,
-        })
+        }
     }
 
     pub fn create_compute_pipeline(
         &self, 
         desc: ComputePipelineDescriptor<'_>
-    ) -> Result<ComputePipeline, PipelineCreationError> {
+    ) -> ComputePipeline {
         let input_count = desc.inputs.len();
         let bind_group_layout_entries: &'static [wgpu::BindGroupLayoutEntry] = self.alloc.alloc_slice_fill_iter(
             CustomChain::new(
@@ -954,12 +952,9 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader_source = std::fs::read_to_string(desc.shader_file)
-            .map_err(|_| PipelineCreationError::ShaderFileDoesNotExist)?;
-
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_source)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(desc.shader)),
         });
 
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -973,13 +968,13 @@ impl Ctx {
             entry_point: desc.shader_entry,
         });
 
-        Ok(ComputePipeline {
+        ComputePipeline {
             wgpu_pipeline: pipeline,
             shader,
             bind_group,
             bind_group_layout,
             dispatch_count: desc.dispatch_count,
-        })
+        }
     }
 
     pub fn run_render_pipeline<'a>(&self, pass: &mut wgpu::RenderPass<'a>, pipeline: &'a RenderPipeline) {
@@ -1235,16 +1230,11 @@ impl<'a> GPUTimer<'a> {
     }
 }
 
-pub struct HotReloadTimer {
-    pub shader_path: &'static std::path::Path,
-    pub modification_time: std::time::SystemTime,
-}
-
 #[derive(Debug)]
 pub struct ComputePipelineDescriptor<'a> {
     pub inputs: &'a [PipelineInput<'a>],
     pub outputs: &'a [ComputePipelineOutput<'a>],
-    pub shader_file: &'static std::path::Path,
+    pub shader: String,
     pub shader_entry: &'static str,
     pub dispatch_count: [u32; 3],
 }
@@ -1263,7 +1253,7 @@ pub struct ComputePipeline {
 pub struct RenderPipelineDescriptor<'a, 'b> {
     pub inputs: &'b [PipelineInput<'b>],
     pub vertex_buffer: &'a VertexBuffer,
-    pub shader_file: &'static std::path::Path,
+    pub shader: String,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
@@ -1280,7 +1270,7 @@ impl<'a, 'b> From<RenderPipelineDescriptor<'a, 'b>> for RenderPipelineDescriptor
         RenderPipelineDescriptorEx {
             inputs: desc.inputs,
             vertex_buffer: Either::A(desc.vertex_buffer),
-            shader_file: desc.shader_file,
+            shader: desc.shader,
             shader_vertex_entry: desc.shader_vertex_entry,
             shader_fragment_entry: desc.shader_fragment_entry,
             output_format: desc.output_format,
@@ -1302,7 +1292,7 @@ pub enum Either<A, B> {
 pub struct RenderPipelineDescriptorEx<'a, 'b> {
     pub inputs: &'b [PipelineInput<'b>],
     pub vertex_buffer: Either<&'a VertexBuffer, wgpu::PrimitiveTopology>,
-    pub shader_file: &'b std::path::Path,
+    pub shader: String,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
@@ -1330,11 +1320,6 @@ pub struct RenderPipeline<'a> {
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum PipelineCreationError {
-    ShaderFileDoesNotExist,
 }
 
 #[derive(Copy, Clone, Debug)]

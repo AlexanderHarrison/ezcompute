@@ -25,10 +25,10 @@ fn main() {
     let render = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::Uniform(&bounds_uniform)],
         outputs: &[ComputePipelineOutput::StorageTexture(&texture)],
-        shader_file: std::path::Path::new("examples/mandelbrot/shader.wgsl"),
+        shader: include_str!("shader.wgsl").into(),
         shader_entry: "render",
         dispatch_count: texture.dispatch_count((16, 16)),
-    }).unwrap();
+    });
 
     let screen_copier = ctx.create_screen_copier(&texture);
     let screenshot_copier = ctx.create_texture_copier(&texture, &screenshot_texture);
