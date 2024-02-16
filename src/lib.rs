@@ -1,11 +1,6 @@
-use winit::{
-    event_loop::EventLoopBuilder,
-    window::WindowBuilder,
-};
-
 use wgpu::util::DeviceExt;
 
-pub const SURFACE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+pub const OUTPUT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -39,7 +34,8 @@ impl Ctx {
             &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::CLEAR_TEXTURE
-                    | wgpu::Features:: TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                    | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                    | wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: Default::default(),
             },
             None
@@ -66,7 +62,7 @@ impl Ctx {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -78,7 +74,11 @@ impl Ctx {
             push_constant_ranges: &[],
         });
 
-        let copy_sampler = device.create_sampler(&Default::default());
+        let copy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         Self {
             device, queue, instance,
@@ -87,12 +87,57 @@ impl Ctx {
         }
     }
 
-    pub fn run<F>(&self, size: (u32, u32), updates_per_second: u32, mut f: F) where
-        F: FnMut(WindowEvent) -> Option<WindowTask>
+    #[cfg(feature = "winit")]
+    pub fn run<F>(
+        &self,
+        size: (u32, u32),
+        frames_per_second: u32,
+        mut f: F,
+    ) where
+        F: FnMut(&mut wgpu::CommandEncoder, &RenderTexture, f32, Input) -> Option<WindowTask>,
     {
-        let event_loop = EventLoopBuilder::with_user_event().build().unwrap();
+        let mut delta = 0.0;
+        let mut keys = Vec::with_capacity(16);
+        let mut mouse_position = None;
+        let mut mouse_scroll = 0.0;
+        let mut mouse_buttons = MouseButtons { left: None, middle: None, right: None };
 
-        let window = WindowBuilder::new()
+        self.run_ex(
+            size, 
+            frames_per_second,
+            |ev| match ev {
+                WindowEvent::Update { delta: new_delta, input: new_input } => {
+                    mouse_position = new_input.mouse_position;
+                    mouse_scroll = new_input.mouse_scroll;
+                    keys.clear();
+                    keys.extend_from_slice(new_input.key_events);
+                    delta = new_delta;
+                    mouse_buttons = new_input.mouse_buttons;
+                    Some(WindowTaskEx::Redraw)
+                }
+                WindowEvent::Redraw { output } => {
+                    let mut encoder = self.device.create_command_encoder(&Default::default());
+                    let input = Input { key_events: &keys, mouse_position, mouse_scroll, mouse_buttons };
+                    let event = (f)(&mut encoder, output, delta, input);
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                    event.map(WindowTaskEx::from)
+                }
+            }
+        )
+    }
+
+    #[cfg(feature = "winit")]
+    pub fn run_ex<F>(
+        &self,
+        size: (u32, u32),
+        updates_per_second: u32,
+        mut f: F,
+    ) where
+        F: FnMut(WindowEvent) -> Option<WindowTaskEx>,
+    {
+        let event_loop = winit::event_loop::EventLoopBuilder::with_user_event().build().unwrap();
+
+        let window = winit::window::WindowBuilder::new()
             .with_min_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
             .with_max_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
             .build(&event_loop).unwrap();
@@ -103,7 +148,7 @@ impl Ctx {
 
         let mut surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: SURFACE_TEXTURE_FORMAT,
+            format: OUTPUT_TEXTURE_FORMAT,
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
@@ -113,7 +158,12 @@ impl Ctx {
         };
         surface.configure(&self.device, &surface_config);
 
-        let update_period = std::time::Duration::from_secs_f64((updates_per_second as f64 * 1.0).recip());
+        // Why was this done?
+        // I've had some bad experiences with winit events.
+        // It seems like any method I use other than roll my own update loop
+        // either runs at full speed with no throttling, or has inconsistent update timing.
+        struct Update;
+        let update_period = std::time::Duration::from_secs_f64((updates_per_second as f64).recip());
         let event_sender = event_loop.create_proxy();
         std::thread::spawn(move || {
             loop {
@@ -123,6 +173,9 @@ impl Ctx {
         });
 
         let mut keys: Vec<KeyEvent> = Vec::with_capacity(16);
+        let mut mouse_position: Option<(f32, f32)> = None;
+        let mut mouse_scroll: f32 = 0.0;
+        let mut mouse_buttons = MouseButtons { left: None, middle: None, right: None };
 
         let mut prev_update_instant = None;
 
@@ -166,17 +219,20 @@ impl Ctx {
                 };
                 prev_update_instant = Some(now);
 
-                let events = KeyEvents { events: keys.as_slice() };
-                match (f)(WindowEvent::Update { delta, keys: events }) {
-                    Some(WindowTask::Redraw) => window.request_redraw(),
-                    Some(WindowTask::Exit) => window_target.exit(),
+                let input = Input { key_events: &keys, mouse_position, mouse_scroll, mouse_buttons };
+                match (f)(WindowEvent::Update { delta, input }) {
+                    Some(WindowTaskEx::Redraw) => window.request_redraw(),
+                    Some(WindowTaskEx::Exit) => window_target.exit(),
                     None => (),
                 }
 
-                keys.retain_mut(|k| {
+                for k in keys.iter_mut() {
                     k.state = KeyState::Held;
-                    !k.queued_release
-                });
+                }
+                mouse_scroll = 0.0;
+                if mouse_buttons.left.is_some() { mouse_buttons.left = Some(KeyState::Held); }
+                if mouse_buttons.middle.is_some() { mouse_buttons.middle = Some(KeyState::Held); }
+                if mouse_buttons.right.is_some() { mouse_buttons.right = Some(KeyState::Held); }
             },
             winit::event::Event::WindowEvent {
                 ref event,
@@ -202,11 +258,12 @@ impl Ctx {
                         let view = texture.create_view(&Default::default());
                         let null_texture = std::mem::replace(&mut output.texture, texture);
                         let null_view = std::mem::replace(&mut output.view, view);
+                        
                         match (f)(WindowEvent::Redraw { output: &output }) {
-                            Some(WindowTask::Redraw) => window.request_redraw(),
-                            Some(WindowTask::Exit) => window_target.exit(),
+                            Some(WindowTaskEx::Redraw) => window.request_redraw(),
+                            Some(WindowTaskEx::Exit) => window_target.exit(),
                             None => (),
-                        };
+                        }
 
                         let texture = std::mem::replace(&mut output.texture, null_texture);
                         output.view = null_view;
@@ -214,6 +271,40 @@ impl Ctx {
                     });
                     window.pre_present_notify();
                     surface_texture.present();
+                },
+                winit::event::WindowEvent::CursorMoved { position, .. } => {
+                    mouse_position = Some((position.x as f32, position.y as f32));
+                },
+                winit::event::WindowEvent::CursorLeft { .. } => {
+                    mouse_position = None;
+                },
+                winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                    match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                            mouse_scroll += y;
+                        }
+                        _ => (),
+                    }
+                },
+                winit::event::WindowEvent::MouseInput { 
+                    state: winit::event::ElementState::Pressed, button, .. 
+                } => {
+                    match button {
+                        winit::event::MouseButton::Left => mouse_buttons.left = Some(KeyState::JustPressed),
+                        winit::event::MouseButton::Middle => mouse_buttons.middle = Some(KeyState::JustPressed),
+                        winit::event::MouseButton::Right => mouse_buttons.right = Some(KeyState::JustPressed),
+                        _ => (),
+                    }
+                },
+                winit::event::WindowEvent::MouseInput { 
+                    state: winit::event::ElementState::Released, button, .. 
+                } => {
+                    match button {
+                        winit::event::MouseButton::Left => mouse_buttons.left = None,
+                        winit::event::MouseButton::Middle => mouse_buttons.middle = None,
+                        winit::event::MouseButton::Right => mouse_buttons.right = None,
+                        _ => (),
+                    }
                 },
                 winit::event::WindowEvent::Resized(new_size) => {
                     surface_config.width = new_size.width;
@@ -231,7 +322,7 @@ impl Ctx {
                     // occurs during repeat presses
                     if keys.iter().any(|k| k.key == *physical_key) { return };
 
-                    keys.push(KeyEvent { key: *physical_key, state: KeyState::JustPressed, queued_release: false })
+                    keys.push(KeyEvent { key: *physical_key, state: KeyState::JustPressed })
                 },
                 winit::event::WindowEvent::KeyboardInput {
                     event: winit::event::KeyEvent { 
@@ -241,19 +332,7 @@ impl Ctx {
                     },
                     ..
                 } => {
-                    keys.retain_mut(|k| {
-                        if k.key != *physical_key {
-                            true
-                        } else {
-                            match k.state {
-                                KeyState::Held => false,
-                                KeyState::JustPressed => {
-                                    k.queued_release = true;
-                                    true
-                                }
-                            }
-                        }
-                    });
+                    keys.retain_mut(|k| k.key != *physical_key);
                 }
                 winit::event::WindowEvent::CloseRequested => window_target.exit(),
                 _ => (),
@@ -262,6 +341,7 @@ impl Ctx {
         }).expect("error running event loop")
     }
 
+    // #[cfg(feature = "video")]
     //pub fn record<F>(
     //    &self, 
     //    output: &'static str, 
@@ -406,17 +486,47 @@ impl Ctx {
     }
 
     pub fn create_storage_buffer<T: bytemuck::NoUninit>(&self, data: &[T]) -> StorageBuffer {
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        });
+        self.create_storage_buffer_ex::<T>(Either::A(data), wgpu::BufferUsages::empty())
+    }
+
+    pub fn create_storage_buffer_empty<T: bytemuck::NoUninit>(&self, len: usize) -> StorageBuffer {
+        self.create_storage_buffer_ex::<T>(Either::B(len), wgpu::BufferUsages::empty())
+    }
+
+    pub fn create_storage_buffer_ex<T: bytemuck::NoUninit>(
+        &self, 
+        data_or_size: Either<&[T], usize>,
+        extra_usages: wgpu::BufferUsages,
+    ) -> StorageBuffer {
+        if std::alloc::Layout::new::<T>().size() == 0 { panic!("buffer size cannot be zero") }
+
 
         let layout = std::alloc::Layout::new::<T>();
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC 
+            | wgpu::BufferUsages::COPY_DST | extra_usages;
+
+        let buffer = match data_or_size {
+            Either::A(data) => {
+                if data.len() == 0 { panic!("buffer size cannot be zero") }
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage,
+                })
+            },
+            Either::B(len) => {
+                if len == 0 { panic!("buffer size cannot be zero") }
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: len as u64 * layout.size() as u64,
+                    usage,
+                    mapped_at_creation: false,
+                })
+            }
+        };
 
         StorageBuffer { buffer, layout }
     }
-
 
     pub fn create_uniform<T: bytemuck::NoUninit>(&self, data: &T) -> Uniform {
         let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -556,7 +666,6 @@ impl Ctx {
                     entry_point: "fs_main",
                     targets: &[Some(wgpu::ColorTargetState {
                         format: target_format,
-                        //blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -641,7 +750,7 @@ impl Ctx {
                 module: &self.copy_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: SURFACE_TEXTURE_FORMAT,
+                    format: OUTPUT_TEXTURE_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -674,24 +783,7 @@ impl Ctx {
         &self, 
         desc: RenderPipelineDescriptor<'a, 'b>
     ) -> Result<RenderPipeline<'a>, PipelineCreationError> {
-        let draw_range = if let Some(ref ib) = desc.vertex_buffer.index_buffer {
-            0..ib.index_count
-        } else {
-            0..desc.vertex_buffer.vertex_count
-        };
-
-        self.create_render_pipeline_ex(RenderPipelineDescriptorEx {
-            inputs: desc.inputs,
-            vertex_buffer: Either::A(desc.vertex_buffer),
-            shader_file: desc.shader_file,
-            shader_vertex_entry: desc.shader_vertex_entry,
-            shader_fragment_entry: desc.shader_fragment_entry,
-            output_format: desc.output_format,
-            primitives: desc.vertex_buffer.primitives,
-            draw_range,
-            blend_state: None,
-            instance_range: 0..1,
-        })
+        self.create_render_pipeline_ex(desc.into())
     }
 
     pub fn create_render_pipeline_ex<'a, 'b>(
@@ -762,13 +854,17 @@ impl Ctx {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
+            depth_stencil: if !desc.disable_depth_test {
+                Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                })
+            } else { 
+                None 
+            },
             multisample: wgpu::MultisampleState {
                 //count: desc.multisample_count,
                 ..Default::default()
@@ -979,7 +1075,7 @@ impl Ctx {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         copier: &ScreenCopier,
-        output: &Texture,
+        output: &RenderTexture,
     ) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
@@ -1053,13 +1149,102 @@ impl Ctx {
             },
         }
     }
+
+    pub fn create_timer(&self) -> GPUTimer {
+        let max_timestamp_count = 256u32;
+
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: None,
+            ty: wgpu::QueryType::Timestamp,
+            count: max_timestamp_count,
+        });
+
+        let timestamp_period = self.queue.get_timestamp_period();
+        if timestamp_period == 0.0 { panic!("timestamps are unsupported on this machine") }
+
+        let query_resolution_buffer = self.create_storage_buffer_ex::<u64>(
+            Either::B(max_timestamp_count as _),
+            wgpu::BufferUsages::QUERY_RESOLVE
+        );
+
+        GPUTimer {
+            query_set,
+            timestamp_period,
+            query_resolution_buffer,
+
+            timestamp_idx: 0,
+            timestamp_labels: Vec::new(),
+            ctx: self
+        }
+    }
+}
+
+pub struct GPUTimer<'a> {
+    pub query_set: wgpu::QuerySet,
+    pub query_resolution_buffer: StorageBuffer,
+    pub timestamp_period: f32,
+
+    pub timestamp_idx: u32,
+    pub timestamp_labels: Vec<&'static str>,
+    pub ctx: &'a Ctx,
+}
+
+impl<'a> GPUTimer<'a> {
+    pub fn reset(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.timestamp_idx = 0;
+        self.write_timestamp(encoder);
+        self.timestamp_labels.clear();
+    }
+
+    pub fn split(&mut self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        self.timestamp_labels.push(label);
+        self.write_timestamp(encoder);
+    }
+
+    pub fn print(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(
+            &self.query_set, 
+            0..self.timestamp_idx, 
+            &self.query_resolution_buffer.buffer,
+            0
+        );
+
+        let times = self.query_resolution_buffer.read_to_vec::<u64>(self.ctx);
+        let mut start_time = times[0];
+        let period = self.timestamp_period as f64;
+        for i in 1..(self.timestamp_idx as usize) {
+            let timestamp = times[i];
+            let label = self.timestamp_labels[i-1];
+            let t = (timestamp - start_time) as f64 * period;
+            if t > 1_000_000_000.0 {
+                println!("{}: {:3}s", label, t / 1_000_000_000.0);
+            } else if t > 1_000_000.0 {
+                println!("{}: {:3}ms", label, t / 1_000_000.0);
+            } else if t > 1_000.0 {
+                println!("{}: {:3}us", label, t / 1_000.0);
+            } else {
+                println!("{}: {:3}ns", label, t);
+            }
+            start_time = timestamp;
+        }
+    }
+
+    fn write_timestamp(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.write_timestamp(&self.query_set, self.timestamp_idx);
+        self.timestamp_idx += 1;
+    }
+}
+
+pub struct HotReloadTimer {
+    pub shader_path: &'static std::path::Path,
+    pub modification_time: std::time::SystemTime,
 }
 
 #[derive(Debug)]
 pub struct ComputePipelineDescriptor<'a> {
     pub inputs: &'a [PipelineInput<'a>],
     pub outputs: &'a [ComputePipelineOutput<'a>],
-    pub shader_file: &'a std::path::Path,
+    pub shader_file: &'static std::path::Path,
     pub shader_entry: &'static str,
     pub dispatch_count: [u32; 3],
 }
@@ -1078,10 +1263,33 @@ pub struct ComputePipeline {
 pub struct RenderPipelineDescriptor<'a, 'b> {
     pub inputs: &'b [PipelineInput<'b>],
     pub vertex_buffer: &'a VertexBuffer,
-    pub shader_file: &'b std::path::Path,
+    pub shader_file: &'static std::path::Path,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
+}
+
+impl<'a, 'b> From<RenderPipelineDescriptor<'a, 'b>> for RenderPipelineDescriptorEx<'a, 'b> {
+    fn from(desc: RenderPipelineDescriptor<'a, 'b>) -> Self {
+        let draw_range = if let Some(ref ib) = desc.vertex_buffer.index_buffer {
+            0..ib.index_count
+        } else {
+            0..desc.vertex_buffer.vertex_count
+        };
+
+        RenderPipelineDescriptorEx {
+            inputs: desc.inputs,
+            vertex_buffer: Either::A(desc.vertex_buffer),
+            shader_file: desc.shader_file,
+            shader_vertex_entry: desc.shader_vertex_entry,
+            shader_fragment_entry: desc.shader_fragment_entry,
+            output_format: desc.output_format,
+            draw_range,
+            blend_state: None,
+            instance_range: 0..1,
+            disable_depth_test: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1098,11 +1306,13 @@ pub struct RenderPipelineDescriptorEx<'a, 'b> {
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
-    pub primitives: wgpu::PrimitiveTopology,
     pub blend_state: Option<wgpu::BlendState>,
 
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
+    
+    /// If set, you will need to run your own render pass with depth stencil disabled.
+    pub disable_depth_test: bool,
 }
 
 #[derive(Debug)]
@@ -1285,6 +1495,76 @@ impl StorageBuffer {
         assert!(workgroup_size != 0);
         [(self.len() + workgroup_size-1)/workgroup_size, 1, 1]
     }
+
+    /// Panics if `T` has a different layout that the buffer's type,
+    /// or the buffer size and capacity are not a multiples of `T`'s size.
+    pub fn read_to_vec<T: bytemuck::Pod>(&self, ctx: &Ctx) -> Vec<T> {
+        assert_eq!(std::alloc::Layout::new::<T>(), self.layout);
+
+        let buf_u8 = self.read_to_vec_bytes(ctx);
+
+        let size_t = std::alloc::Layout::new::<T>().pad_to_align().size();
+        assert_eq!(buf_u8.len() % size_t, 0);
+        assert_eq!(buf_u8.capacity() % size_t, 0);
+
+        unsafe {
+            // Ensure the original vector is not dropped.
+            let mut buf = std::mem::ManuallyDrop::new(buf_u8);
+            Vec::from_raw_parts(buf.as_mut_ptr() as *mut T,
+                                buf.len() / size_t,
+                                buf.capacity() / size_t)
+        }
+    }
+
+    pub fn read_to_vec_bytes(&self, ctx: &Ctx) -> Vec<u8> {
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        self.read(ctx, sender);
+        match receiver.recv() {
+            Ok(buf) => buf,
+            Err(e) => panic!("reading data buffer failed: {}", e),
+        }
+    }
+
+    pub fn read(&self, ctx: &Ctx, sender: std::sync::mpsc::Sender<Vec<u8>>) {
+        let size = self.buffer.size();
+
+        let intermediate_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&self.buffer, 0, &intermediate_buffer, 0, size);
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+
+        let arc_buffer = std::sync::Arc::new(intermediate_buffer);
+        let callback_buffer = arc_buffer.clone();
+
+        arc_buffer.slice(..)
+            .map_async(
+                wgpu::MapMode::Read,
+                move |res| {
+                    match res {
+                        Ok(_) => (),
+                        Err(_) => {
+                            eprintln!("buffer read failed");
+                            return;
+                        }
+                    };
+
+                    let data = callback_buffer.slice(..).get_mapped_range().to_vec();
+
+                    match sender.send(data) {
+                        Ok(_) => (),
+                        Err(e) => eprintln!("buffer data send failed: {}", e),
+                    }
+                }
+            );
+
+        ctx.device.poll(wgpu::Maintain::Wait);
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1328,6 +1608,7 @@ pub struct VertexBuffer {
 }
 
 impl Texture {
+    #[cfg(feature = "images")]
     pub fn read_to_png(&self, ctx: &Ctx, file: &std::path::Path) {
         let buf = self.read_to_vec(ctx);
         let width = self.texture.width();
@@ -1435,61 +1716,86 @@ impl Texture {
         ctx.device.poll(wgpu::Maintain::Wait);
     }
 
-    pub fn dispatch_count(&self, workgroup_size: [u32; 2]) -> [u32; 3] {
+    pub fn dispatch_count(&self, workgroup_size: (u32, u32)) -> [u32; 3] {
         let size = self.texture.size();
-        assert!(workgroup_size[0] != 0);
-        assert!(workgroup_size[1] != 0);
-        let w_width = workgroup_size[0];
-        let w_height = workgroup_size[1];
+        assert!(workgroup_size.0 != 0);
+        assert!(workgroup_size.1 != 0);
+        let w_width = workgroup_size.0;
+        let w_height = workgroup_size.1;
         [(size.width + w_width-1)/w_width, (size.height + w_height-1)/w_height, 1]
     }
 }
 
-struct Update;
-
-#[derive(Debug, Copy, Clone)]
-pub enum WindowEvent<'a> { 
-    Redraw {
-        output: &'a RenderTexture,
-    },
-    Update {
-        delta: f32,
-        keys: KeyEvents<'a>,
-    }, 
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum WindowTask { Redraw, Exit, }
-
-pub use winit::keyboard::KeyCode as Key;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum KeyState {
-    JustPressed,
-    Held,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyEvent {
-    pub key: Key,
-    pub state: KeyState,
-    pub(crate) queued_release: bool,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct KeyEvents<'a> {
-    pub events: &'a [KeyEvent],
-}
-
-impl<'a> KeyEvents<'a> {
-    pub fn just_pressed(&self, key: Key) -> bool {
-        self.events.iter().any(|event| event.key == key && event.state == KeyState::JustPressed)
+#[cfg(feature = "winit")]
+mod winit_things {
+    #[derive(Debug, Copy, Clone)]
+    pub enum WindowEvent<'a> { 
+        Redraw {
+            output: &'a super::RenderTexture,
+        },
+        Update {
+            delta: f32,
+            input: Input<'a>,
+        }, 
     }
 
-    pub fn down(&self, key: Key) -> bool {
-        self.events.iter().any(|event| event.key == key)
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum WindowTaskEx { Redraw, Exit, }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum WindowTask { Exit }
+
+    impl From<WindowTask> for WindowTaskEx {
+        fn from(task: WindowTask) -> Self {
+            match task { WindowTask::Exit => WindowTaskEx::Exit }
+        }
     }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub struct MouseButtons {
+        pub left: Option<KeyState>,
+        pub middle: Option<KeyState>,
+        pub right: Option<KeyState>,
+    }
+
+    pub use winit::keyboard::KeyCode as Key;
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum KeyState {
+        JustPressed,
+        Held,
+    }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub struct KeyEvent {
+        pub key: Key,
+        pub state: KeyState,
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    pub struct Input<'a> {
+        pub key_events: &'a [KeyEvent],
+        pub mouse_position: Option<(f32, f32)>,
+        
+        /// positive -> scroll down, negative -> scroll up
+        pub mouse_scroll: f32,
+        pub mouse_buttons: MouseButtons,
+    }
+
+    impl<'a> Input<'a> {
+        pub fn just_pressed(&self, key: Key) -> bool {
+            self.key_events.iter().any(|event| event.key == key && event.state == KeyState::JustPressed)
+        }
+
+        pub fn held(&self, key: Key) -> bool {
+            self.key_events.iter().any(|event| event.key == key)
+        }
+    }
+
 }
+
+#[cfg(feature = "winit")]
+pub use winit_things::*;
 
 /// std Chain doesn't impl ExactSizeIterator >:(
 struct CustomChain<A, B> {

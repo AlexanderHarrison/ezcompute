@@ -8,7 +8,7 @@ struct Point {
 @group(0) @binding(1) var field: texture_storage_2d<rg32float, write>;
 @group(0) @binding(2) var screen: texture_storage_2d<rgba8unorm, write>;
 
-@workgroup_size(16, 16, 1)
+@workgroup_size(16, 16)
 @compute 
 fn calculate_field(@builtin(global_invocation_id) id: vec3<u32>) {
     let field_size = textureDimensions(field).xy;
