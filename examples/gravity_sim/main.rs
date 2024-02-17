@@ -27,8 +27,8 @@ fn main() {
     ];
     let points_buffer = ctx.create_storage_buffer(&POINTS);
     let new_points_buffer = ctx.create_storage_buffer(&POINTS);
-    let field_texture = ctx.create_storage_texture((W, H), wgpu::TextureFormat::Rg32Float);
-    let screen_texture = ctx.create_storage_texture((W, H), wgpu::TextureFormat::Rgba8Unorm);
+    let field_texture = ctx.create_storage_texture((W, H), StorageTextureFormat::Rg32Float);
+    let screen_texture = ctx.create_storage_texture((W, H), StorageTextureFormat::Rgba8Unorm);
 
     let update_points_pipeline = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[
@@ -38,10 +38,10 @@ fn main() {
         outputs: &[
             ComputePipelineOutput::StorageBuffer(&new_points_buffer),
         ],
-        shader_file: std::path::Path::new("examples/points/move.wgsl"),
+        shader: include_str!("move.wgsl").into(),
         shader_entry: "write_points",
         dispatch_count: points_buffer.dispatch_count(64),
-    }).unwrap();
+    });
 
     let field_creation_pipeline = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[
@@ -51,10 +51,10 @@ fn main() {
             ComputePipelineOutput::StorageTexture(&field_texture),
             ComputePipelineOutput::StorageTexture(&screen_texture),
         ],
-        shader_file: std::path::Path::new("examples/points/field.wgsl"),
+        shader: include_str!("field.wgsl").into(),
         shader_entry: "calculate_field",
         dispatch_count: field_texture.dispatch_count((16, 16))
-    }).unwrap();
+    });
 
     //ctx.record(
     //    "video.mp4",
@@ -86,7 +86,7 @@ fn main() {
         ctx.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    let screen_copier = ctx.create_screen_copier(&screen_texture);
+    let screen_copier = ctx.create_screen_copier(&screen_texture, ScalingType::Nearest);
 
     ctx.run((W, H), 60, |encoder, output, _, _| {
         ctx.run_compute_pass(encoder, &[&update_points_pipeline, &field_creation_pipeline]);

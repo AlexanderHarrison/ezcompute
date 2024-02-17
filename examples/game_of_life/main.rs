@@ -14,9 +14,9 @@ fn main() {
         *cell = rng.bool() as u32;
     }
 
-    let cells_texture = ctx.create_storage_texture_with_data((W, H), wgpu::TextureFormat::R32Uint, &initial_cells);
-    let cells_texture_out = ctx.create_storage_texture((W, H), wgpu::TextureFormat::R32Uint);
-    let screen_texture = ctx.create_storage_texture((W, H), wgpu::TextureFormat::Rgba8Unorm);
+    let cells_texture = ctx.create_storage_texture_with_data((W, H), StorageTextureFormat::R32Uint, &initial_cells);
+    let cells_texture_out = ctx.create_storage_texture((W, H), StorageTextureFormat::R32Uint);
+    let screen_texture = ctx.create_storage_texture((W, H), StorageTextureFormat::Rgba8Unorm);
 
     let update_pipeline = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[
@@ -26,13 +26,13 @@ fn main() {
             ComputePipelineOutput::StorageTexture(&cells_texture_out),
             ComputePipelineOutput::StorageTexture(&screen_texture),
         ],
-        shader_file: std::path::Path::new("examples/game_of_life/update.wgsl"),
+        shader: include_str!("update.wgsl").into(),
         shader_entry: "update",
         dispatch_count: cells_texture.dispatch_count((16, 16)),
-    }).unwrap();
+    });
 
-    let back_copy = ctx.create_texture_copier(&cells_texture_out, &cells_texture);
-    let screen_copy = ctx.create_screen_copier(&screen_texture);
+    let back_copy = ctx.create_texture_copier_fast(&cells_texture_out, &cells_texture);
+    let screen_copy = ctx.create_screen_copier(&screen_texture, ScalingType::Nearest);
 
     let mut running = true;
     let mut step = false;

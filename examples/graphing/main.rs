@@ -26,18 +26,18 @@ fn main() {
     let path_strip_create = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::StorageBuffer(&points), PipelineInput::Uniform(&bounds_uniform)],
         outputs: &[ComputePipelineOutput::StorageBuffer(&vertex_buffer)],
-        shader_file: std::path::Path::new("examples/graphing/path_create.wgsl"),
+        shader: include_str!("path_create.wgsl").into(),
         shader_entry: "path_create",
         dispatch_count: points.dispatch_count(32),
-    }).unwrap();
+    });
 
     let points_create = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::Uniform(&bounds_uniform)],
         outputs: &[ComputePipelineOutput::StorageBuffer(&points)],
-        shader_file: std::path::Path::new("examples/graphing/function.wgsl"),
+        shader: include_str!("function.wgsl").into(),
         shader_entry: "points_create",
         dispatch_count: points.dispatch_count(32),
-    }).unwrap();
+    });
 
     let vbuffer = VertexBuffer {
         vertex_buffer: vertex_buffer.buffer,
@@ -54,11 +54,11 @@ fn main() {
     let path_strip_render = ctx.create_render_pipeline(RenderPipelineDescriptor {
         inputs: &[],
         vertex_buffer: &vbuffer,
-        shader_file: std::path::Path::new("examples/graphing/path_render.wgsl"),
+        shader: include_str!("path_render.wgsl").into(),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,
-    }).unwrap();
+    });
 
     #[derive(Copy, Clone)]
     struct TranslationState {
@@ -104,7 +104,7 @@ fn main() {
             bounds_uniform.update(&ctx, &bounds);
         }
 
-        timer.reset(encoder);
+        timer.start(encoder);
         ctx.run_compute_pass(encoder, &[&points_create, &path_strip_create]);
         timer.split(encoder, "compute pass");
         ctx.run_render_pass(encoder, output, wgpu::Color::BLACK, &[&path_strip_render]);

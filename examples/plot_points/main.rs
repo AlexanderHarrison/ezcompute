@@ -52,31 +52,20 @@ fn main() {
     let mut view_state = ViewState { scale: [0.8; 2], rotation: [0.0; 2] };
     let view_state_uniform = ctx.create_uniform(&view_state);
 
+    // We disable depth test to allow points at the back of the sphere to draw correctly.
+    // Enable it and see what happens!
     let render_points = ctx.create_render_pipeline_ex(RenderPipelineDescriptorEx {
         inputs: &[PipelineInput::StorageBuffer(&points_buffer), PipelineInput::Uniform(&view_state_uniform)],
         vertex_buffer: Either::B(wgpu::PrimitiveTopology::TriangleStrip),
-        shader_file: std::path::Path::new("examples/plot_points/shader.wgsl"),
+        shader: include_str!("shader.wgsl").into(),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,
         blend_state: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        //blend_state: Some(wgpu::BlendState {
-        //    color: wgpu::BlendComponent {
-        //        src_factor: wgpu::BlendFactor::Src,
-        //        dst_factor: wgpu::BlendFactor::Src,
-        //        operation: wgpu::BlendOperation::Max,
-        //    },
-        //    alpha: wgpu::BlendComponent {
-        //        src_factor: wgpu::BlendFactor::Src,
-        //        dst_factor: wgpu::BlendFactor::Src,
-        //        operation: wgpu::BlendOperation::Multiply,
-        //    },
-        //    //alpha: wgpu::BlendComponent::REPLACE,
-        //}),
         draw_range: 0..4,
         instance_range: 0..(SIZE as _),
         disable_depth_test: true,
-    }).unwrap();
+    });
 
     ctx.run((W, H), 60, |encoder, output, _delta, keys| {
         let mut uniform_written = false;
@@ -109,23 +98,8 @@ fn main() {
             view_state_uniform.update(&ctx, &view_state)
         }
 
-        // We disabled depth test, so we need to create a render pass not using it
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &output.view,
-                resolve_target: None,
-                    ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
-        });
-        ctx.run_render_pipeline(&mut pass, &render_points);
-        
+        ctx.run_render_pass(encoder, output, wgpu::Color::BLACK, &[&render_points]);
+
         if keys.just_pressed(Key::KeyQ) { 
             Some(WindowTask::Exit) 
         } else {

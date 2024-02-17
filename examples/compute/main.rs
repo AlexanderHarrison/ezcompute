@@ -45,10 +45,10 @@ fn main() {
     let update_points = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::StorageBuffer(&points_buffer_in)],
         outputs: &[ComputePipelineOutput::StorageBuffer(&points_buffer_out)],
-        shader_file: std::path::Path::new("examples/compute/shader.wgsl"),
+        shader: include_str!("shader.wgsl").into(),
         shader_entry: "update",
         dispatch_count: points_buffer_in.dispatch_count(16),
-    }).unwrap();
+    });
 
     let mut encoder = ctx.device.create_command_encoder(&Default::default());
     for _ in 0..1000 {
@@ -57,7 +57,7 @@ fn main() {
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 
-    let points = points_buffer_in.read_to_vec_typed::<Point>(&ctx);
+    let points = points_buffer_in.read_to_vec::<Point>(&ctx);
 
     for p in points {
         println!("{}, {}, {}", p.x, p.y, p.z);

@@ -10,7 +10,8 @@ pub struct Ctx {
 
     pub copy_pipeline_layout: wgpu::PipelineLayout,
     pub copy_bind_group_layout: wgpu::BindGroupLayout,
-    pub copy_sampler: wgpu::Sampler,
+    pub copy_sampler_nearest: wgpu::Sampler,
+    pub copy_sampler_linear: wgpu::Sampler,
     pub copy_shader: wgpu::ShaderModule,
 
     pub alloc: &'static bumpalo::Bump,
@@ -74,15 +75,17 @@ impl Ctx {
             push_constant_ranges: &[],
         });
 
-        let copy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let copy_sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
             min_filter: wgpu::FilterMode::Linear,
             mag_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
+        let copy_sampler_nearest = device.create_sampler(&Default::default());
+
         Self {
             device, queue, instance,
-            copy_pipeline_layout, copy_bind_group_layout, copy_sampler, copy_shader,
+            copy_pipeline_layout, copy_bind_group_layout, copy_sampler_linear, copy_sampler_nearest, copy_shader,
             alloc: Box::leak(Box::new(bumpalo::Bump::new())),
         }
     }
@@ -538,15 +541,15 @@ impl Ctx {
         Uniform { buffer, layout, }
     }
 
-    /// texture format for storage texture must be rgba8unorm
-    pub fn create_storage_texture(&self, size: (u32, u32), format: wgpu::TextureFormat) -> Texture {
+    /// texture format for storage texture must be rgba8unorm, TODO
+    pub fn create_storage_texture(&self, size: (u32, u32), format: StorageTextureFormat) -> Texture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format,
+            format: format.into(),
             usage: wgpu::TextureUsages::STORAGE_BINDING 
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
@@ -559,11 +562,11 @@ impl Ctx {
         Texture { texture, view }
     }
 
-    /// texture format for storage texture must be rgba8unorm
+    /// texture format for storage texture must be rgba8unorm, TODO
     pub fn create_storage_texture_with_data<T: bytemuck::NoUninit>(
         &self,
         size: (u32, u32), 
-        format: wgpu::TextureFormat,
+        format: StorageTextureFormat,
         data: &[T]
     ) -> Texture {
         let texture = self.device.create_texture_with_data(
@@ -574,7 +577,7 @@ impl Ctx {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: format.into(),
                 usage: wgpu::TextureUsages::STORAGE_BINDING 
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
@@ -599,6 +602,7 @@ impl Ctx {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -642,60 +646,54 @@ impl Ctx {
         RenderTexture { texture, view, depth_texture, depth_view }
     }
 
-    pub fn create_texture_copier<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
-        let source_format = src.texture.format();
-        let target_format = dst.texture.format();
+    /// Requires texture formats to only differ in Srgb-ness and have the same size and dimensions.
+    pub fn create_texture_copier_fast<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
+        let src_format = src.texture.format();
+        let dst_format = dst.texture.format();
+        assert!(
+            src_format.remove_srgb_suffix() == dst_format.remove_srgb_suffix(),
+            "create_texture_copier_fast: Texture formats do not match: src = {:?}, dst = {:?}\nFormats may only differ in Srgb-ness", 
+            src_format,
+            dst_format
+        );
 
-        let formats_match = source_format.remove_srgb_suffix() == target_format.remove_srgb_suffix();
-        let dims_match = src.texture.dimension() == dst.texture.dimension();
-        let size_match = src.texture.size() == dst.texture.size();
+        let src_dim = src.texture.dimension();
+        let dst_dim = dst.texture.dimension();
+        assert!(
+            src_dim == dst_dim,
+            "create_texture_copier_fast: Texture dimensions do not match: src = {:?}, dst = {:?}", 
+            src_dim,
+            dst_dim
+        );
+
+        let src_size = src.texture.size();
+        let dst_size = dst.texture.size();
+        assert!(
+            src_size == dst_size,
+            "create_texture_copier_fast: Texture sizes do not match: src = {:?}, dst = {:?}", 
+            src_size,
+            dst_size
+        );
         
-        if formats_match && dims_match && size_match {
-            TextureCopier::Fast { src, dst }
-        } else {
-            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: None,
-                layout: Some(&self.copy_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &self.copy_shader,
-                    entry_point: "vs_main",
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &self.copy_shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(), // tri list
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            });
-
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.copy_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
-                    },
-                ],
-            });
-
-            TextureCopier::Slow { pipeline, bind_group, dst }
-        }
+        TextureCopier::Fast { src, dst }
     }
 
-    pub fn create_texture_copier_transparent<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
+    /// Does not support integer texture formats (Uint, Sint).
+    pub fn create_texture_copier<'a>(
+        &self, 
+        src: &'a Texture, 
+        dst: &'a Texture,
+        scaling_type: ScalingType,
+    ) -> TextureCopier<'a> {
+        self.create_texture_copier_ex(TextureCopierDescriptorEx {
+            src, 
+            dst, 
+            scaling_type,
+            clear_colour: Some(wgpu::Color::BLACK),
+        })
+    }
+
+    pub fn create_texture_copier_ex<'a>(&self, desc: TextureCopierDescriptorEx<'a>) -> TextureCopier<'a> {
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&self.copy_pipeline_layout),
@@ -708,8 +706,12 @@ impl Ctx {
                 module: &self.copy_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: dst.texture.format(),
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    format: desc.dst.texture.format(),
+                    blend: if desc.clear_colour.is_none() {
+                        Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)
+                    } else {
+                        None
+                    },
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -725,19 +727,25 @@ impl Ctx {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&src.view),
+                    resource: wgpu::BindingResource::TextureView(&desc.src.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
+                    resource: wgpu::BindingResource::Sampler(match desc.scaling_type {
+                        ScalingType::Linear => &self.copy_sampler_linear,
+                        ScalingType::Nearest => &self.copy_sampler_nearest,
+                    }),
                 },
             ],
         });
 
-        TextureCopier::Transparent { pipeline, bind_group, dst }
+        match desc.clear_colour {
+            Some(c) => TextureCopier::Slow { pipeline, bind_group, dst: desc.dst, clear_colour: c },
+            None => TextureCopier::Transparent { pipeline, bind_group, dst: desc.dst },
+        }
     }
 
-    pub fn create_screen_copier<'a>(&self, src: &'a Texture) -> ScreenCopier {
+    pub fn create_screen_copier<'a>(&self, src: &'a Texture, scaling_type: ScalingType) -> ScreenCopier {
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&self.copy_pipeline_layout),
@@ -771,7 +779,10 @@ impl Ctx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.copy_sampler),
+                    resource: wgpu::BindingResource::Sampler(match scaling_type {
+                        ScalingType::Linear => &self.copy_sampler_linear,
+                        ScalingType::Nearest => &self.copy_sampler_nearest,
+                    }),
                 },
             ],
         });
@@ -887,6 +898,7 @@ impl Ctx {
             vertex_buffer,
             instance_range: desc.instance_range,
             draw_range: desc.draw_range,
+            disable_depth_test: desc.disable_depth_test,
         }
     }
 
@@ -1010,30 +1022,41 @@ impl Ctx {
         clear_colour: wgpu::Color, 
         passes: &[&RenderPipeline]
     ) {
-        let desc = wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &output.view,
-                resolve_target: None,
+        if passes.len() > 0 {
+            let disable_depth_test = passes[0].disable_depth_test;
+            if passes[1..].iter().any(|pass| pass.disable_depth_test != disable_depth_test) {
+                panic!("run_render_pass: RenderPipeline disable_depth_test must not be varied across pipelines in a single pass");
+            }
+
+            let desc = wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output.view,
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_colour),
-                    store: wgpu::StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(clear_colour),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: if !disable_depth_test {
+                    Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &output.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    })
+                } else {
+                    None
                 },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &output.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            occlusion_query_set: None,
-            timestamp_writes: None,
-        };
-        let mut pass = encoder.begin_render_pass(&desc);
-        for pipeline in passes {
-            self.run_render_pipeline(&mut pass, pipeline);
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            };
+            let mut pass = encoder.begin_render_pass(&desc);
+            for pipeline in passes {
+                self.run_render_pipeline(&mut pass, pipeline);
+            }
         }
     }
 
@@ -1104,14 +1127,14 @@ impl Ctx {
                     src.texture.size(),
                 )
             },
-            TextureCopier::Slow { ref pipeline, ref bind_group, dst } => {
+            TextureCopier::Slow { ref pipeline, ref bind_group, dst, clear_colour } => {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: None,
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &dst.view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(*clear_colour),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1146,19 +1169,17 @@ impl Ctx {
     }
 
     pub fn create_timer(&self) -> GPUTimer {
-        let max_timestamp_count = 256u32;
-
         let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: None,
             ty: wgpu::QueryType::Timestamp,
-            count: max_timestamp_count,
+            count: GPUTimer::MAX_TIMESTAMP_COUNT,
         });
 
         let timestamp_period = self.queue.get_timestamp_period();
         if timestamp_period == 0.0 { panic!("timestamps are unsupported on this machine") }
 
         let query_resolution_buffer = self.create_storage_buffer_ex::<u64>(
-            Either::B(max_timestamp_count as _),
+            Either::B(GPUTimer::MAX_TIMESTAMP_COUNT as _),
             wgpu::BufferUsages::QUERY_RESOLVE
         );
 
@@ -1185,18 +1206,29 @@ pub struct GPUTimer<'a> {
 }
 
 impl<'a> GPUTimer<'a> {
-    pub fn reset(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub const MAX_TIMESTAMP_COUNT: u32 = 255u32;
+
+    pub fn start(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.timestamp_idx = 0;
         self.write_timestamp(encoder);
         self.timestamp_labels.clear();
     }
 
     pub fn split(&mut self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        if self.timestamp_idx == 255 { 
+            eprintln!("GPUTimer misuse - too many splits: call start, then splits, then print");
+            return 
+        }
         self.timestamp_labels.push(label);
         self.write_timestamp(encoder);
     }
 
     pub fn print(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.timestamp_idx as usize != self.timestamp_labels.len()+1 { 
+            eprintln!("GPUTimer misuse: call start, then splits, then print");
+            return;
+        }
+
         encoder.resolve_query_set(
             &self.query_set, 
             0..self.timestamp_idx, 
@@ -1205,6 +1237,7 @@ impl<'a> GPUTimer<'a> {
         );
 
         let times = self.query_resolution_buffer.read_to_vec::<u64>(self.ctx);
+
         let mut start_time = times[0];
         let period = self.timestamp_period as f64;
         for i in 1..(self.timestamp_idx as usize) {
@@ -1301,7 +1334,7 @@ pub struct RenderPipelineDescriptorEx<'a, 'b> {
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
     
-    /// If set, you will need to run your own render pass with depth stencil disabled.
+    /// This must not be varied across pipelines in a single pass.
     pub disable_depth_test: bool,
 }
 
@@ -1320,6 +1353,7 @@ pub struct RenderPipeline<'a> {
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
+    pub disable_depth_test: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1408,6 +1442,19 @@ impl<'a> ComputePipelineOutput<'a> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum ScalingType {
+    Nearest,
+    Linear,
+}
+
+pub struct TextureCopierDescriptorEx<'a> {
+    pub src: &'a Texture,
+    pub dst: &'a Texture,
+    pub scaling_type: ScalingType,
+    pub clear_colour: Option<wgpu::Color>,
+}
+
 #[derive(Debug)]
 pub enum TextureCopier<'a> {
     Fast {
@@ -1417,7 +1464,8 @@ pub enum TextureCopier<'a> {
     Slow {
         pipeline: wgpu::RenderPipeline,
         bind_group: wgpu::BindGroup,
-        dst: &'a Texture
+        dst: &'a Texture,
+        clear_colour: wgpu::Color,
     },
     Transparent {
         pipeline: wgpu::RenderPipeline,
@@ -1624,9 +1672,13 @@ impl Texture {
         let height = self.texture.height();
 
         let format = self.texture.format();
-        assert!(format == wgpu::TextureFormat::Bgra8Unorm 
-                || format == wgpu::TextureFormat::Bgra8UnormSrgb 
-                || format == wgpu::TextureFormat::Rgba8Unorm);
+        assert!(
+            format == wgpu::TextureFormat::Bgra8Unorm 
+            || format == wgpu::TextureFormat::Bgra8UnormSrgb 
+            || format == wgpu::TextureFormat::Rgba8Unorm
+            || format == wgpu::TextureFormat::Rgba8UnormSrgb,
+            "To read a texture, the format must be: Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, or Rgba8UnormSrgb"
+        );
 
         let bytes_per_row_packed = width * 4;
         let bytes_per_row_texture = if bytes_per_row_packed & 255 != 0 {
@@ -1836,5 +1888,99 @@ where
 {
     fn len(&self) -> usize {
         self.size_hint().0
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum StorageTextureFormat {
+    R8Unorm,
+    Rg8Unorm,
+    Rgba8Unorm,
+
+    R8Snorm,
+    Rg8Snorm,
+    Rgba8Snorm,
+
+    R8Uint,
+    Rg8Uint,
+    Rgba8Uint,
+
+    R8Sint,
+    Rg8Sint,
+    Rgba8Sint,
+
+    R16Unorm,
+    Rg16Unorm,
+    Rgba16Unorm,
+
+    R16Snorm,
+    Rg16Snorm,
+    Rgba16Snorm,
+
+    R16Uint,
+    Rg16Uint,
+    Rgba16Uint,
+
+    R16Sint,
+    Rg16Sint,
+    Rgba16Sint,
+
+    R16Float,
+    Rg16Float,
+    Rgba16Float,
+
+    R32Uint,
+    Rg32Uint,
+    Rgba32Uint,
+
+    R32Sint,
+    Rg32Sint,
+    Rgba32Sint,
+
+    R32Float,
+    Rg32Float,
+    Rgba32Float,
+}
+
+impl Into<wgpu::TextureFormat> for StorageTextureFormat {
+    fn into(self) -> wgpu::TextureFormat {
+        match self {
+            Self::R8Unorm     => wgpu::TextureFormat::R8Unorm    ,
+            Self::Rg8Unorm    => wgpu::TextureFormat::Rg8Unorm   ,
+            Self::Rgba8Unorm  => wgpu::TextureFormat::Rgba8Unorm ,
+            Self::R8Snorm     => wgpu::TextureFormat::R8Snorm    ,
+            Self::Rg8Snorm    => wgpu::TextureFormat::Rg8Snorm   ,
+            Self::Rgba8Snorm  => wgpu::TextureFormat::Rgba8Snorm ,
+            Self::R8Uint      => wgpu::TextureFormat::R8Uint     ,
+            Self::Rg8Uint     => wgpu::TextureFormat::Rg8Uint    ,
+            Self::Rgba8Uint   => wgpu::TextureFormat::Rgba8Uint  ,
+            Self::R8Sint      => wgpu::TextureFormat::R8Sint     ,
+            Self::Rg8Sint     => wgpu::TextureFormat::Rg8Sint    ,
+            Self::Rgba8Sint   => wgpu::TextureFormat::Rgba8Sint  ,
+            Self::R16Unorm    => wgpu::TextureFormat::R16Unorm   ,
+            Self::Rg16Unorm   => wgpu::TextureFormat::Rg16Unorm  ,
+            Self::Rgba16Unorm => wgpu::TextureFormat::Rgba16Unorm,
+            Self::R16Snorm    => wgpu::TextureFormat::R16Snorm   ,
+            Self::Rg16Snorm   => wgpu::TextureFormat::Rg16Snorm  ,
+            Self::Rgba16Snorm => wgpu::TextureFormat::Rgba16Snorm,
+            Self::R16Uint     => wgpu::TextureFormat::R16Uint    ,
+            Self::Rg16Uint    => wgpu::TextureFormat::Rg16Uint   ,
+            Self::Rgba16Uint  => wgpu::TextureFormat::Rgba16Uint ,
+            Self::R16Sint     => wgpu::TextureFormat::R16Sint    ,
+            Self::Rg16Sint    => wgpu::TextureFormat::Rg16Sint   ,
+            Self::Rgba16Sint  => wgpu::TextureFormat::Rgba16Sint ,
+            Self::R16Float    => wgpu::TextureFormat::R16Float   ,
+            Self::Rg16Float   => wgpu::TextureFormat::Rg16Float  ,
+            Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+            Self::R32Uint     => wgpu::TextureFormat::R32Uint    ,
+            Self::Rg32Uint    => wgpu::TextureFormat::Rg32Uint   ,
+            Self::Rgba32Uint  => wgpu::TextureFormat::Rgba32Uint ,
+            Self::R32Sint     => wgpu::TextureFormat::R32Sint    ,
+            Self::Rg32Sint    => wgpu::TextureFormat::Rg32Sint   ,
+            Self::Rgba32Sint  => wgpu::TextureFormat::Rgba32Sint ,
+            Self::R32Float    => wgpu::TextureFormat::R32Float   ,
+            Self::Rg32Float   => wgpu::TextureFormat::Rg32Float  ,
+            Self::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+        }
     }
 }

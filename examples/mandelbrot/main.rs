@@ -13,8 +13,8 @@ struct WorldBounds {
 fn main() {
     let ctx = Ctx::new();
 
-    let texture = ctx.create_storage_texture((W*2, H*2), wgpu::TextureFormat::Rgba8Unorm);
-    let screenshot_texture = ctx.create_storage_texture((W, H), wgpu::TextureFormat::Rgba8Unorm);
+    let texture = ctx.create_storage_texture((W*2, H*2), StorageTextureFormat::Rgba8Unorm);
+    let screenshot_texture = ctx.create_texture((W, H), wgpu::TextureFormat::Rgba8UnormSrgb);
 
     let mut bounds = WorldBounds {
         pos: [0.0; 2],
@@ -30,8 +30,8 @@ fn main() {
         dispatch_count: texture.dispatch_count((16, 16)),
     });
 
-    let screen_copier = ctx.create_screen_copier(&texture);
-    let screenshot_copier = ctx.create_texture_copier(&texture, &screenshot_texture);
+    let screen_copier = ctx.create_screen_copier(&texture, ScalingType::Linear);
+    let screenshot_copier = ctx.create_texture_copier(&texture, &screenshot_texture, ScalingType::Linear);
 
     let mut timer = ctx.create_timer();
 
@@ -42,6 +42,8 @@ fn main() {
     }
     let mut translation_state: Option<TranslationState> = None;
 
+    // We use run_ex to separate the update loop from the render loop.
+    // This allows us to update at a constant 60Hz while render iterations may take longer.
     const SCROLL_FACTOR: f32 = 1.1;
     ctx.run_ex((W, H), 60, |ev| match ev {
         WindowEvent::Update { input, .. } => {
@@ -77,7 +79,7 @@ fn main() {
                 let mut encoder = ctx.device.create_command_encoder(&Default::default());
                 ctx.copy_texture_to_texture(&mut encoder, &screenshot_copier);
                 ctx.queue.submit(std::iter::once(encoder.finish()));
-                screenshot_texture.read_to_png(&ctx, std::path::Path::new("examples/mandelbrot/mandelbrot.png"));
+                screenshot_texture.read_to_png(&ctx, std::path::Path::new("mandelbrot.png"));
                 println!("Saved screenshot!");
             }
 
@@ -92,7 +94,7 @@ fn main() {
         },
         WindowEvent::Redraw { output } => {
             let mut encoder = ctx.device.create_command_encoder(&Default::default());
-            timer.reset(&mut encoder);
+            timer.start(&mut encoder);
             ctx.run_compute_pass(&mut encoder, &[&render]);
             timer.split(&mut encoder, "render");
             ctx.copy_texture_to_screen(&mut encoder, &screen_copier, output);

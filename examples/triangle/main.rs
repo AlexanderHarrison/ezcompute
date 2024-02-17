@@ -14,11 +14,11 @@ fn main() {
     let render_tri = ctx.create_render_pipeline(RenderPipelineDescriptor {
         inputs: &[],
         vertex_buffer: &vertex_buffer,
-        shader_file: std::path::Path::new("examples/triangle/shader.wgsl"),
+        shader: include_str!("shader.wgsl").into(),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,
-    }).unwrap();
+    });
 
     ctx.run((512, 512), 30, |encoder, output, _time_delta, _input| {
         ctx.run_render_pass(encoder, output, wgpu::Color::BLACK, &[&render_tri]);
