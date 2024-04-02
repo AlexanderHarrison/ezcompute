@@ -26,7 +26,7 @@ fn main() {
     let path_strip_create = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::StorageBuffer(&points), PipelineInput::Uniform(&bounds_uniform)],
         outputs: &[ComputePipelineOutput::StorageBuffer(&vertex_buffer)],
-        shader: include_str!("path_create.wgsl").into(),
+        shader: Shader::String(include_str!("path_create.wgsl")),
         shader_entry: "path_create",
         dispatch_count: points.dispatch_count(32),
     });
@@ -34,7 +34,7 @@ fn main() {
     let points_create = ctx.create_compute_pipeline(ComputePipelineDescriptor {
         inputs: &[PipelineInput::Uniform(&bounds_uniform)],
         outputs: &[ComputePipelineOutput::StorageBuffer(&points)],
-        shader: include_str!("function.wgsl").into(),
+        shader: Shader::String(include_str!("function.wgsl")),
         shader_entry: "points_create",
         dispatch_count: points.dispatch_count(32),
     });

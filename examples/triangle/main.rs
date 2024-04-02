@@ -14,7 +14,7 @@ fn main() {
     let render_tri = ctx.create_render_pipeline(RenderPipelineDescriptor {
         inputs: &[],
         vertex_buffer: &vertex_buffer,
-        shader: include_str!("shader.wgsl").into(),
+        shader: ShaderSource::Str(include_str!("shader.wgsl")),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,

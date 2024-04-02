@@ -1,8 +1,17 @@
+#[cfg(test)]
+mod tests;
+
 use wgpu::util::DeviceExt;
 
 pub const OUTPUT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
-#[derive(Debug)]
+const DEBUG_LINES: bool = false;
+
+#[cfg(feature = "vello")]
+pub use vello;
+
+pub use wgpu;
+
 pub struct Ctx {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -15,6 +24,9 @@ pub struct Ctx {
     pub copy_shader: wgpu::ShaderModule,
 
     pub alloc: &'static bumpalo::Bump,
+
+    #[cfg(feature = "vello")]
+    pub vello_renderer: std::cell::RefCell<vello::Renderer>,
 }
 
 impl Ctx {
@@ -36,7 +48,12 @@ impl Ctx {
                 label: None,
                 required_features: wgpu::Features::CLEAR_TEXTURE
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                    | wgpu::Features::TIMESTAMP_QUERY,
+                    | wgpu::Features::TIMESTAMP_QUERY
+                    | if DEBUG_LINES {
+                        wgpu::Features::POLYGON_MODE_LINE
+                    } else {
+                        wgpu::Features::empty()
+                    },
                 required_limits: Default::default(),
             },
             None
@@ -82,11 +99,22 @@ impl Ctx {
         });
 
         let copy_sampler_nearest = device.create_sampler(&Default::default());
+        
+        #[cfg(feature = "vello")]
+        let vello_renderer = std::cell::RefCell::new(vello::Renderer::new(&device, vello::RendererOptions {
+            use_cpu: false,
+            surface_format: Some(OUTPUT_TEXTURE_FORMAT),
+            antialiasing_support: vello::AaSupport::area_only(),
+            num_init_threads: None,
+        }).unwrap());
 
         Self {
             device, queue, instance,
             copy_pipeline_layout, copy_bind_group_layout, copy_sampler_linear, copy_sampler_nearest, copy_shader,
             alloc: Box::leak(Box::new(bumpalo::Bump::new())),
+
+            #[cfg(feature = "vello")]
+            vello_renderer,
         }
     }
 
@@ -344,6 +372,34 @@ impl Ctx {
         }).expect("error running event loop")
     }
 
+    #[cfg(feature = "vello")]
+    pub fn draw_scene(
+        &self,
+        scene: &vello::Scene,
+        output: &Texture,
+        base_colour: vello::peniko::Color,
+    ) {
+        assert_eq!(
+            output.texture.format(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            "Vello requires that textures have format Rgba8Unorm"
+        );
+
+        let size = output.texture.size();
+        self.vello_renderer.borrow_mut().render_to_texture(
+            &self.device,
+            &self.queue,
+            scene, 
+            &output.view,
+            &vello::RenderParams {
+                base_color: base_colour,
+                width: size.width,
+                height: size.height,
+                antialiasing_method: vello::AaConfig::Area,
+            }
+        ).unwrap();
+    }
+
     // #[cfg(feature = "video")]
     //pub fn record<F>(
     //    &self, 
@@ -431,6 +487,32 @@ impl Ctx {
 
     //    write_thread.join().unwrap();
     //}
+
+    pub fn create_instance_buffer<T: bytemuck::NoUninit>(
+        &self, 
+        desc: InstanceBufferDescriptor<'_, T>,
+    ) -> InstanceBuffer {
+        let attributes: &'static [wgpu::VertexAttribute] = self.alloc.alloc_slice_copy(desc.attributes);
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<T>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes,
+        };
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(desc.instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let count = desc.instances.len() as u32;
+
+        InstanceBuffer {
+            buffer,
+            vertex_layout,
+            count
+        }
+    }
 
     pub fn create_vertex_buffer<T: bytemuck::NoUninit>(
         &self, 
@@ -541,7 +623,6 @@ impl Ctx {
         Uniform { buffer, layout, }
     }
 
-    /// texture format for storage texture must be rgba8unorm, TODO
     pub fn create_storage_texture(&self, size: (u32, u32), format: StorageTextureFormat) -> Texture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -562,7 +643,6 @@ impl Ctx {
         Texture { texture, view }
     }
 
-    /// texture format for storage texture must be rgba8unorm, TODO
     pub fn create_storage_texture_with_data<T: bytemuck::NoUninit>(
         &self,
         size: (u32, u32), 
@@ -650,27 +730,27 @@ impl Ctx {
     pub fn create_texture_copier_fast<'a>(&self, src: &'a Texture, dst: &'a Texture) -> TextureCopier<'a> {
         let src_format = src.texture.format();
         let dst_format = dst.texture.format();
-        assert!(
-            src_format.remove_srgb_suffix() == dst_format.remove_srgb_suffix(),
-            "create_texture_copier_fast: Texture formats do not match: src = {:?}, dst = {:?}\nFormats may only differ in Srgb-ness", 
+        assert_eq!(
+            src_format.remove_srgb_suffix(), dst_format.remove_srgb_suffix(),
+            "Ctx::create_texture_copier_fast: Texture formats do not match: src = {:?}, dst = {:?}\nFormats may only differ in Srgb-ness", 
             src_format,
             dst_format
         );
 
         let src_dim = src.texture.dimension();
         let dst_dim = dst.texture.dimension();
-        assert!(
-            src_dim == dst_dim,
-            "create_texture_copier_fast: Texture dimensions do not match: src = {:?}, dst = {:?}", 
+        assert_eq!(
+            src_dim, dst_dim,
+            "Ctx::create_texture_copier_fast: Texture dimensions do not match: src = {:?}, dst = {:?}", 
             src_dim,
             dst_dim
         );
 
         let src_size = src.texture.size();
         let dst_size = dst.texture.size();
-        assert!(
-            src_size == dst_size,
-            "create_texture_copier_fast: Texture sizes do not match: src = {:?}, dst = {:?}", 
+        assert_eq!(
+            src_size, dst_size,
+            "Ctx::create_texture_copier_fast: Texture sizes do not match: src = {:?}, dst = {:?}", 
             src_size,
             dst_size
         );
@@ -836,14 +916,28 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let wgpu_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(desc.shader)),
+            source: wgpu::ShaderSource::Wgsl(desc.shader.to_cow()),
         });
 
-        let (vertex_buffer, primitives, vb_layout) = match desc.vertex_buffer {
-            Either::A(vbo) => (Some(vbo), vbo.primitives, Some(vbo.vertex_layout.clone())),
-            Either::B(primitives) => (None, primitives, None),
+        let (vertex_buffer, primitives, vbuffers): (_, _, &'static _) = match (desc.vertex_buffer, desc.instance_buffer) {
+            (Either::A(vbo), None) => (
+                Some(vbo), 
+                vbo.primitives, 
+                self.alloc.alloc_slice_clone(&[vbo.vertex_layout.clone()])
+            ),
+            (Either::A(vbo), Some(ibo)) => (
+                Some(vbo), 
+                vbo.primitives, 
+                self.alloc.alloc_slice_clone(&[vbo.vertex_layout.clone(), ibo.vertex_layout.clone()])
+            ),
+            (Either::B(primitives), None) => (None, primitives, &[]),
+            (Either::B(primitives), Some(ibo))  => (
+                None, 
+                primitives, 
+                self.alloc.alloc_slice_clone(&[ibo.vertex_layout.clone()])
+            ),
         };
 
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -854,13 +948,18 @@ impl Ctx {
                 push_constant_ranges: &[],
             })),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &wgpu_shader,
                 entry_point: desc.shader_vertex_entry,
-                buffers: vb_layout.as_slice(),
+                buffers: vbuffers,
             },
             primitive: wgpu::PrimitiveState {
                 topology: primitives,
-                cull_mode: None,
+                cull_mode: desc.cull_mode,
+                polygon_mode: if DEBUG_LINES {
+                    wgpu::PolygonMode::Line
+                } else {
+                    wgpu::PolygonMode::Fill
+                },
                 ..Default::default()
             },
             depth_stencil: if !desc.disable_depth_test {
@@ -879,7 +978,7 @@ impl Ctx {
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &wgpu_shader,
                 entry_point: desc.shader_fragment_entry,
                 targets: &[Some(wgpu::ColorTargetState {
                     format: desc.output_format,
@@ -892,13 +991,14 @@ impl Ctx {
 
         RenderPipeline {
             wgpu_pipeline: pipeline,
-            shader,
+            shader: desc.shader,
             bind_group: bind_group,
-            bind_group_layout: bind_group_layout,
             vertex_buffer,
+            instance_buffer: desc.instance_buffer,
             instance_range: desc.instance_range,
             draw_range: desc.draw_range,
             disable_depth_test: desc.disable_depth_test,
+            output_format: desc.output_format,
         }
     }
 
@@ -964,25 +1064,29 @@ impl Ctx {
             entries: bind_group_entries,
         });
 
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let wgpu_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(desc.shader)),
+            source: wgpu::ShaderSource::Wgsl(desc.shader.to_cow()),
+        });
+
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
 
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
-            layout: Some(&self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            })),
-            module: &shader,
+            layout: Some(&layout),
+            module: &wgpu_shader,
             entry_point: desc.shader_entry,
         });
 
         ComputePipeline {
             wgpu_pipeline: pipeline,
-            shader,
+            shader: desc.shader,
+            layout,
+            shader_entry: desc.shader_entry,
             bind_group,
             bind_group_layout,
             dispatch_count: desc.dispatch_count,
@@ -994,21 +1098,41 @@ impl Ctx {
         pass.set_bind_group(0, &pipeline.bind_group, &[]);
         let draw_range = pipeline.draw_range.clone();
         let instance_range = pipeline.instance_range.clone();
-        if let Some(v) = pipeline.vertex_buffer {
-            pass.set_vertex_buffer(0, v.vertex_buffer.slice(..));
 
-            if let Some(ref ib) = v.index_buffer {
-                pass.set_index_buffer(ib.buffer.slice(..), ib.format);
-                pass.draw_indexed(draw_range, 0, instance_range);
-             } else {
+        match (pipeline.vertex_buffer, pipeline.instance_buffer) {
+            (None, None) => pass.draw(draw_range, instance_range),
+            (Some(v), i) => {
+                pass.set_vertex_buffer(0, v.vertex_buffer.slice(..));
+
+
+                if let Some(i) = i {
+                    pass.set_vertex_buffer(1, i.buffer.slice(..));
+                }
+
+                if let Some(ref ib) = v.index_buffer {
+                    pass.set_index_buffer(ib.buffer.slice(..), ib.format);
+                    pass.draw_indexed(draw_range, 0, instance_range);
+                } else {
+                    pass.draw(draw_range, instance_range);
+                }
+            },
+            (None, Some(i)) => {
+                pass.set_vertex_buffer(0, i.buffer.slice(..));
                 pass.draw(draw_range, instance_range);
-             }
-        } else {
-            pass.draw(draw_range, instance_range);
+            }
         }
     }
 
     pub fn run_compute_pipeline<'a>(&self, pass: &mut wgpu::ComputePass<'a>, pipeline: &'a ComputePipeline) {
+        //let t = std::time::Instant::now();
+        //if let ShaderSource::File(path) = pipeline.shader {
+        //    if let Ok(metadata) = std::fs::metadata(path) {
+        //        if let Ok(modified) = metadata.modified() {
+        //            println!("modified: {:?}", modified);
+        //        }
+        //    }
+        //}
+        //println!("{}", t.elapsed().as_nanos());
         pass.set_pipeline(&pipeline.wgpu_pipeline);
         pass.set_bind_group(0, &pipeline.bind_group, &[]);
         let [x, y, z] = pipeline.dispatch_count;
@@ -1022,6 +1146,13 @@ impl Ctx {
         clear_colour: wgpu::Color, 
         passes: &[&RenderPipeline]
     ) {
+        for pass in passes {
+            assert_eq!(
+                pass.output_format, output.texture.format(),
+                "Ctx::run_render_pass: Output texture format )ust match the output formats of the RenderPipelines"
+            )
+        }
+
         if passes.len() > 0 {
             let disable_depth_test = passes[0].disable_depth_test;
             if passes[1..].iter().any(|pass| pass.disable_depth_test != disable_depth_test) {
@@ -1085,7 +1216,15 @@ impl Ctx {
         src: &StorageBuffer,
         dst: &StorageBuffer
     ) {
-        assert!(src.layout == dst.layout);
+        assert_eq!(
+            src.buffer.size(), dst.buffer.size(), 
+           "Ctx::copy_buffer_to_buffer: buffers must be the same size"
+        );
+
+        assert_eq!(
+            src.layout, dst.layout, 
+           "Ctx::copy_buffer_to_buffer: buffers must contain the same type"
+        );
         encoder.copy_buffer_to_buffer(&src.buffer, 0, &dst.buffer, 0, src.buffer.size());
     }
 
@@ -1267,17 +1406,38 @@ impl<'a> GPUTimer<'a> {
 pub struct ComputePipelineDescriptor<'a> {
     pub inputs: &'a [PipelineInput<'a>],
     pub outputs: &'a [ComputePipelineOutput<'a>],
-    pub shader: String,
+    pub shader: ShaderSource,
     pub shader_entry: &'static str,
     pub dispatch_count: [u32; 3],
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum ShaderSource {
+    Str(&'static str),
+    File(&'static std::path::Path),
+}
+
+impl ShaderSource {
+    pub fn to_cow(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            ShaderSource::Str(s) => std::borrow::Cow::Borrowed(s),
+            ShaderSource::File(p) => {
+                match std::fs::read_to_string(p) {
+                    Ok(s) => std::borrow::Cow::Owned(s),
+                    Err(e) => panic!("Could not open shader {}: {}", p.display(), e),
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ComputePipeline {
     pub wgpu_pipeline: wgpu::ComputePipeline,
     pub bind_group: wgpu::BindGroup,
-    pub shader: wgpu::ShaderModule,
+    pub layout: wgpu::PipelineLayout,
+    pub shader: ShaderSource,
+    pub shader_entry: &'static str,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub dispatch_count: [u32; 3],
 }
@@ -1286,7 +1446,7 @@ pub struct ComputePipeline {
 pub struct RenderPipelineDescriptor<'a, 'b> {
     pub inputs: &'b [PipelineInput<'b>],
     pub vertex_buffer: &'a VertexBuffer,
-    pub shader: String,
+    pub shader: ShaderSource,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
@@ -1303,12 +1463,14 @@ impl<'a, 'b> From<RenderPipelineDescriptor<'a, 'b>> for RenderPipelineDescriptor
         RenderPipelineDescriptorEx {
             inputs: desc.inputs,
             vertex_buffer: Either::A(desc.vertex_buffer),
+            instance_buffer: None,
             shader: desc.shader,
             shader_vertex_entry: desc.shader_vertex_entry,
             shader_fragment_entry: desc.shader_fragment_entry,
             output_format: desc.output_format,
             draw_range,
             blend_state: None,
+            cull_mode: None,
             instance_range: 0..1,
             disable_depth_test: false,
         }
@@ -1325,11 +1487,13 @@ pub enum Either<A, B> {
 pub struct RenderPipelineDescriptorEx<'a, 'b> {
     pub inputs: &'b [PipelineInput<'b>],
     pub vertex_buffer: Either<&'a VertexBuffer, wgpu::PrimitiveTopology>,
-    pub shader: String,
+    pub instance_buffer: Option<&'a InstanceBuffer>,
+    pub shader: ShaderSource,
     pub shader_vertex_entry: &'static str,
     pub shader_fragment_entry: &'static str,
     pub output_format: wgpu::TextureFormat,
     pub blend_state: Option<wgpu::BlendState>,
+    pub cull_mode: Option<wgpu::Face>,
 
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
@@ -1349,11 +1513,12 @@ pub struct RenderPipeline<'a> {
     pub wgpu_pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub vertex_buffer: Option<&'a VertexBuffer>,
-    pub shader: wgpu::ShaderModule,
-    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub instance_buffer: Option<&'a InstanceBuffer>,
+    pub shader: ShaderSource,
     pub draw_range: std::ops::Range<u32>,
     pub instance_range: std::ops::Range<u32>,
     pub disable_depth_test: bool,
+    pub output_format: wgpu::TextureFormat,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1508,14 +1673,22 @@ pub struct RenderTexture {
 
 impl Uniform {
     pub fn update<T: bytemuck::NoUninit>(&self, ctx: &Ctx, data: &T) {
-        assert!(std::alloc::Layout::new::<T>() == self.layout);
+        assert_eq!(
+            std::alloc::Layout::new::<T>(),
+            self.layout,
+            "Uniform::update: Cannot update a uniform with a different type than what the Uniform was instantiated with"
+        );
         ctx.queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(std::slice::from_ref(data)));
     }
 }
 
 impl StorageBuffer {
     pub fn update<T: bytemuck::NoUninit>(&self, ctx: &Ctx, data: &[T]) {
-        assert!(std::alloc::Layout::new::<T>() == self.layout);
+        assert_eq!(
+            std::alloc::Layout::new::<T>(),
+            self.layout,
+            "StorageBuffer::update: Cannot update a buffer with a different type than what the buffer was instantiated with"
+        );
         ctx.queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
     }
 
@@ -1525,20 +1698,28 @@ impl StorageBuffer {
     }
 
     pub fn dispatch_count(&self, workgroup_size: u32) -> [u32; 3] {
-        assert!(workgroup_size != 0);
+        assert_ne!(
+            workgroup_size,
+            0,
+            "StorageBuffer::dispatch: workgroup_size cannot be zero"
+        );
         [(self.len() + workgroup_size-1)/workgroup_size, 1, 1]
     }
 
     /// Panics if `T` has a different layout that the buffer's type,
     /// or the buffer size and capacity are not a multiples of `T`'s size.
     pub fn read_to_vec<T: bytemuck::Pod>(&self, ctx: &Ctx) -> Vec<T> {
-        assert_eq!(std::alloc::Layout::new::<T>(), self.layout);
+        assert_eq!(
+            std::alloc::Layout::new::<T>(),
+            self.layout,
+            "StorageBuffer::read_to_vec: Cannot read a buffer into a Vec with a different type"
+        );
 
         let buf_u8 = self.read_to_vec_bytes(ctx);
 
         let size_t = std::alloc::Layout::new::<T>().pad_to_align().size();
-        assert_eq!(buf_u8.len() % size_t, 0);
-        assert_eq!(buf_u8.capacity() % size_t, 0);
+        assert_eq!(buf_u8.len() % size_t, 0, "Error satisfying type size and alignment");
+        assert_eq!(buf_u8.capacity() % size_t, 0, "Error satisfying type size and alignment");
 
         unsafe {
             // Ensure the original vector is not dropped.
@@ -1617,6 +1798,12 @@ impl<'a> IndexBufferData<'a> {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub struct InstanceBufferDescriptor<'a, T: bytemuck::NoUninit> {
+    pub instances: &'a [T],
+    pub attributes: &'a [wgpu::VertexAttribute],
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct VertexBufferDescriptor<'a, T: bytemuck::NoUninit> {
     pub vertices: &'a [T],
     pub attributes: &'a [wgpu::VertexAttribute],
@@ -1640,7 +1827,59 @@ pub struct VertexBuffer {
     pub primitives: wgpu::PrimitiveTopology,
 }
 
+#[derive(Debug)]
+pub struct InstanceBuffer {
+    pub buffer: wgpu::Buffer,
+    pub vertex_layout: wgpu::VertexBufferLayout<'static>,
+    pub count: u32,
+}
+
+impl VertexBufferDescriptor<'static, [f32; 3]> {
+    pub const CUBE: Self = VertexBufferDescriptor {
+        vertices: &[
+            [ 1.0,  1.0,  1.0],
+            [-1.0,  1.0,  1.0],
+            [ 1.0, -1.0,  1.0],
+            [-1.0, -1.0,  1.0],
+            [-1.0, -1.0, -1.0],
+            [-1.0,  1.0,  1.0],
+            [-1.0,  1.0, -1.0],
+            [ 1.0,  1.0,  1.0],
+            [ 1.0,  1.0, -1.0],
+            [ 1.0, -1.0,  1.0],
+            [ 1.0, -1.0, -1.0],
+            [-1.0, -1.0, -1.0],
+            [ 1.0,  1.0, -1.0],
+            [-1.0,  1.0, -1.0]
+        ],
+        attributes: &wgpu::vertex_attr_array!(0 => Float32x3),
+        index_buffer: None,
+        primitives: wgpu::PrimitiveTopology::TriangleStrip,
+    };
+}
+
 impl Texture {
+    // TODO: type validation
+    pub fn update<T: bytemuck::NoUninit>(&self, ctx: &Ctx, data: &[T]) {
+        let size = self.texture.size();
+
+        let bytes_per_row = match self.texture.format().block_copy_size(None) {
+            Some(b) => size.width * b,
+            None => panic!("Texture::update: texture format cannot be updated (block_copy_size() returned None)"),
+        };
+
+        ctx.queue.write_texture(
+            self.texture.as_image_copy(),
+            bytemuck::cast_slice(data),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: None,
+            },
+            size,
+        );
+    }
+
     #[cfg(feature = "images")]
     pub fn read_to_png(&self, ctx: &Ctx, file: &std::path::Path) {
         let buf = self.read_to_vec(ctx);
@@ -1677,7 +1916,7 @@ impl Texture {
             || format == wgpu::TextureFormat::Bgra8UnormSrgb 
             || format == wgpu::TextureFormat::Rgba8Unorm
             || format == wgpu::TextureFormat::Rgba8UnormSrgb,
-            "To read a texture, the format must be: Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, or Rgba8UnormSrgb"
+            "Texture::read: to read a texture, the format must be: Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, or Rgba8UnormSrgb"
         );
 
         let bytes_per_row_packed = width * 4;
@@ -1755,8 +1994,8 @@ impl Texture {
 
     pub fn dispatch_count(&self, workgroup_size: (u32, u32)) -> [u32; 3] {
         let size = self.texture.size();
-        assert!(workgroup_size.0 != 0);
-        assert!(workgroup_size.1 != 0);
+        assert_ne!(workgroup_size.0, 0, "Texture::dispatch_count: workgroup_size cannot be zero");
+        assert_ne!(workgroup_size.1, 0, "Texture::dispatch_count: workgroup_size cannot be zero");
         let w_width = workgroup_size.0;
         let w_height = workgroup_size.1;
         [(size.width + w_width-1)/w_width, (size.height + w_height-1)/w_height, 1]

@@ -57,7 +57,7 @@ fn main() {
     let render_points = ctx.create_render_pipeline_ex(RenderPipelineDescriptorEx {
         inputs: &[PipelineInput::StorageBuffer(&points_buffer), PipelineInput::Uniform(&view_state_uniform)],
         vertex_buffer: Either::B(wgpu::PrimitiveTopology::TriangleStrip),
-        shader: include_str!("shader.wgsl").into(),
+        shader: ShaderSource::Str(include_str!("shader.wgsl")),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,

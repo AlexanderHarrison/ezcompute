@@ -17,12 +17,14 @@ x264 = { version = "0.5.0", optional = true }
 mp4 = { version = "0.14.0", optional = true }
 
 lodepng = { version = "3.10.1", optional = true }
+vello = { version = "0.1.0", optional = true }
 
 [profile.dev]
 opt-level=2
 
 [dev-dependencies]
 fastrand = "2.0.1"
+glam = { version = "0.25", features = ["bytemuck"] }
 
 [features]
 default = ["winit"]
@@ -30,3 +32,8 @@ default = ["winit"]
 winit = ["dep:winit", "dep:take_mut"]
 video = ["dep:x264", "dep:mp4"]
 images = ["dep:lodepng"]
+vello = ["dep:vello"]
+
+[[example]]
+name = "mandelbrot"
+required-features = ["images"]
