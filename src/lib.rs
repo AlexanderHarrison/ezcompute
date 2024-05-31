@@ -49,6 +49,7 @@ impl Ctx {
                 required_features: wgpu::Features::CLEAR_TEXTURE
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                     | wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                     | if DEBUG_LINES {
                         wgpu::Features::POLYGON_MODE_LINE
                     } else {
@@ -162,39 +163,304 @@ impl Ctx {
         &self,
         size: (u32, u32),
         updates_per_second: u32,
-        mut f: F,
+        f: F,
     ) where
         F: FnMut(WindowEvent) -> Option<WindowTaskEx>,
     {
-        let event_loop = winit::event_loop::EventLoopBuilder::with_user_event().build().unwrap();
-
-        let window = winit::window::WindowBuilder::new()
-            .with_min_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
-            .with_max_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
-            .build(&event_loop).unwrap();
-
-        let window: &'static _ = self.alloc.alloc(window);
-        let surface = self.instance.create_surface(window).unwrap();
-        let size = window.inner_size();
-
-        let mut surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: OUTPUT_TEXTURE_FORMAT,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            desired_maximum_frame_latency: 2,
-            view_formats: vec![],
+        use winit::{
+            application::ApplicationHandler,
+            event_loop::{ActiveEventLoop, EventLoop},
+            window::{WindowId, Window},
         };
-        surface.configure(&self.device, &surface_config);
 
-        // Why was this done?
-        // I've had some bad experiences with winit events.
-        // It seems like any method I use other than roll my own update loop
-        // either runs at full speed with no throttling, or has inconsistent update timing.
         struct Update;
+
+        struct PreInitState<'a, F> {
+            pub ctx: &'a Ctx,
+            pub size: (u32, u32),
+            pub update_period: std::time::Duration,
+            pub f: F,
+        }
+
+        struct State<'a, F> {
+            pub ctx: &'a Ctx,
+            pub window: &'static Window,
+            pub surface: wgpu::Surface<'static>,
+            pub surface_config: wgpu::SurfaceConfiguration,
+
+            pub prev_update_instant: Option<std::time::Instant>,
+            pub update_period: std::time::Duration,
+            pub output: RenderTexture,
+            pub f: F,
+
+            pub keys: Vec<KeyEvent>,
+            pub mouse_position: Option<(f32, f32)>,
+            pub mouse_scroll: f32,
+            pub mouse_buttons: MouseButtons,
+        }
+
+        enum StateMaybe<'a, F> {
+            Uninit(PreInitState<'a, F>),
+            Init(State<'a, F>),
+        }
+
+        impl<'a, F> State<'a, F> {
+            fn init(init: PreInitState<'a, F>, event_loop: &ActiveEventLoop) -> Self {
+                let ctx = init.ctx;
+                let window = event_loop.create_window(
+                    Window::default_attributes()
+                        .with_min_inner_size(winit::dpi::PhysicalSize::new(init.size.0, init.size.1))
+                        .with_max_inner_size(winit::dpi::PhysicalSize::new(init.size.0, init.size.1))
+                ).unwrap();
+                let window: &'static Window = ctx.alloc.alloc(window);
+
+                let size = window.inner_size();
+                let surface_config = wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: OUTPUT_TEXTURE_FORMAT,
+                    width: size.width,
+                    height: size.height,
+                    present_mode: wgpu::PresentMode::AutoVsync,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    desired_maximum_frame_latency: 2,
+                    view_formats: vec![],
+                };
+                let surface = ctx.instance.create_surface(window).unwrap();
+                surface.configure(&ctx.device, &surface_config);
+
+                let depth_texture_desc = wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                };
+
+                let depth_texture = ctx.device.create_texture(&depth_texture_desc);
+                let depth_view = depth_texture.create_view(&Default::default());
+
+                let null_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    ..depth_texture_desc
+                });
+                let null_view = null_texture.create_view(&Default::default());
+
+                State {
+                    ctx,
+                    window,
+                    surface,
+                    surface_config,
+
+                    prev_update_instant: None,
+                    update_period: init.update_period,
+
+                    output: RenderTexture {
+                        texture: null_texture,
+                        view: null_view,
+                        depth_texture,
+                        depth_view,
+                    },
+
+                    f: init.f,
+
+                    keys: Vec::with_capacity(16),
+                    mouse_position: None,
+                    mouse_scroll: 0.0,
+                    mouse_buttons: MouseButtons { left: None, middle: None, right: None },
+                }
+            }
+        }
+
+        impl<'a, F> ApplicationHandler<Update> for StateMaybe<'a, F> 
+            where F: FnMut(WindowEvent) -> Option<WindowTaskEx>
+        {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                take_mut::take(self, |s| {
+                    match s {
+                        StateMaybe::Uninit(init) => {
+                            StateMaybe::Init(State::init(init, event_loop))
+                        }
+                        _ => s,
+                    }
+                })
+            }
+
+            fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Update) {
+                let st = match self {
+                    StateMaybe::Uninit(..) => return,
+                    StateMaybe::Init(ref mut st) => st,
+                };
+
+                let now = std::time::Instant::now();
+                let delta = match st.prev_update_instant {
+                    Some(i) => {
+                        let diff: std::time::Duration = now - i;
+                        diff.as_secs_f32()
+                    }
+                    None => st.update_period.as_secs_f32(),
+                };
+                st.prev_update_instant = Some(now);
+
+                let input = Input { 
+                    key_events: &st.keys, 
+                    mouse_position: st.mouse_position, 
+                    mouse_scroll: st.mouse_scroll, 
+                    mouse_buttons: st.mouse_buttons, 
+                };
+                match (st.f)(WindowEvent::Update { delta, input }) {
+                    Some(WindowTaskEx::Redraw) => st.window.request_redraw(),
+                    Some(WindowTaskEx::Exit) => event_loop.exit(),
+                    None => (),
+                }
+
+                for k in st.keys.iter_mut() {
+                    k.state = KeyState::Held;
+                }
+                st.mouse_scroll = 0.0;
+                if st.mouse_buttons.left.is_some() { st.mouse_buttons.left = Some(KeyState::Held); }
+                if st.mouse_buttons.middle.is_some() { st.mouse_buttons.middle = Some(KeyState::Held); }
+                if st.mouse_buttons.right.is_some() { st.mouse_buttons.right = Some(KeyState::Held); }
+            }
+
+            fn window_event(
+                &mut self, 
+                event_loop: &ActiveEventLoop, 
+                window_id: WindowId, 
+                event: winit::event::WindowEvent
+            ) {
+                let st = match self {
+                    StateMaybe::Uninit(..) => return,
+                    StateMaybe::Init(ref mut st) => st,
+                };
+
+                if window_id != st.window.id() { return; }
+
+                let ctx = st.ctx;
+                
+                match event {
+                    winit::event::WindowEvent::RedrawRequested => {
+                        let mut surface_texture = match st.surface.get_current_texture() {
+                            Ok(s) => s,
+                            Err(wgpu::SurfaceError::Timeout) => return,
+                            Err(e) => panic!("{}", e),
+                        };
+
+                        let surface_size = surface_texture.texture.size();
+                        if surface_size != st.output.depth_texture.size() {
+                            st.output.depth_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+                                label: None,
+                                size: surface_size,
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Depth32Float,
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            });
+                            st.output.depth_view = st.output.depth_texture.create_view(&Default::default())
+                        }
+
+                        take_mut::take(&mut surface_texture.texture, |texture| {
+                            let view = texture.create_view(&Default::default());
+                            let null_texture = std::mem::replace(&mut st.output.texture, texture);
+                            let null_view = std::mem::replace(&mut st.output.view, view);
+
+                            let task = (st.f)(WindowEvent::Redraw { output: &st.output });
+                            
+                            match task {
+                                Some(WindowTaskEx::Redraw) => st.window.request_redraw(),
+                                Some(WindowTaskEx::Exit) => event_loop.exit(),
+                                None => (),
+                            }
+
+                            let texture = std::mem::replace(&mut st.output.texture, null_texture);
+                            st.output.view = null_view;
+                            texture
+                        });
+
+                        st.window.pre_present_notify();
+                        surface_texture.present();
+                    },
+                    winit::event::WindowEvent::CursorMoved { position, .. } => {
+                        st.mouse_position = Some((position.x as f32, position.y as f32));
+                    },
+                    winit::event::WindowEvent::CursorLeft { .. } => {
+                        st.mouse_position = None;
+                    },
+                    winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                        match delta {
+                            winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                                st.mouse_scroll += y;
+                            }
+                            _ => (),
+                        }
+                    },
+                    winit::event::WindowEvent::MouseInput { 
+                        state: winit::event::ElementState::Pressed, button, .. 
+                    } => {
+                        match button {
+                            winit::event::MouseButton::Left => st.mouse_buttons.left = Some(KeyState::JustPressed),
+                            winit::event::MouseButton::Middle => st.mouse_buttons.middle = Some(KeyState::JustPressed),
+                            winit::event::MouseButton::Right => st.mouse_buttons.right = Some(KeyState::JustPressed),
+                            _ => (),
+                        }
+                    },
+                    winit::event::WindowEvent::MouseInput { 
+                        state: winit::event::ElementState::Released, button, .. 
+                    } => {
+                        match button {
+                            winit::event::MouseButton::Left => st.mouse_buttons.left = None,
+                            winit::event::MouseButton::Middle => st.mouse_buttons.middle = None,
+                            winit::event::MouseButton::Right => st.mouse_buttons.right = None,
+                            _ => (),
+                        }
+                    },
+                    winit::event::WindowEvent::Resized(new_size) => {
+                        st.surface_config.width = new_size.width;
+                        st.surface_config.height = new_size.height;
+                        st.surface.configure(&ctx.device, &st.surface_config);
+                    },
+                    winit::event::WindowEvent::KeyboardInput {
+                        event: winit::event::KeyEvent { 
+                            state: winit::event::ElementState::Pressed, 
+                            physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
+                            .. 
+                        },
+                        ..
+                    } => {
+                        // occurs during repeat presses
+                        if st.keys.iter().any(|k| k.key == physical_key) { return };
+                        st.keys.push(KeyEvent { key: physical_key, state: KeyState::JustPressed })
+                    },
+                    winit::event::WindowEvent::KeyboardInput {
+                        event: winit::event::KeyEvent { 
+                            state: winit::event::ElementState::Released, 
+                            physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
+                            .. 
+                        },
+                        ..
+                    } => {
+                        st.keys.retain_mut(|k| k.key != physical_key);
+                    }
+                    winit::event::WindowEvent::CloseRequested => event_loop.exit(),
+                    _ => (),
+                }
+            }
+        }
+
         let update_period = std::time::Duration::from_secs_f64((updates_per_second as f64).recip());
+
+        let mut st = StateMaybe::Uninit(PreInitState {
+            ctx: self,
+            size,
+            update_period,
+            f,
+        });
+
+        let event_loop = EventLoop::with_user_event().build().unwrap();
         let event_sender = event_loop.create_proxy();
         std::thread::spawn(move || {
             loop {
@@ -203,173 +469,7 @@ impl Ctx {
             }
         });
 
-        let mut keys: Vec<KeyEvent> = Vec::with_capacity(16);
-        let mut mouse_position: Option<(f32, f32)> = None;
-        let mut mouse_scroll: f32 = 0.0;
-        let mut mouse_buttons = MouseButtons { left: None, middle: None, right: None };
-
-        let mut prev_update_instant = None;
-
-        let depth_texture_desc = wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        };
-
-        let depth_texture = self.device.create_texture(&depth_texture_desc);
-        let depth_view = depth_texture.create_view(&Default::default());
-
-        let null_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            ..depth_texture_desc
-        });
-        let null_view = null_texture.create_view(&Default::default());
-
-        // messy, but it works
-        let mut output = RenderTexture {
-            texture: null_texture,
-            view: null_view,
-            depth_texture,
-            depth_view,
-        };
-
-        event_loop.run(move |event, window_target| match event {
-            winit::event::Event::UserEvent(Update) => {
-                let now = std::time::Instant::now();
-                let delta = match prev_update_instant {
-                    Some(i) => {
-                        let diff: std::time::Duration = now - i;
-                        diff.as_secs_f32()
-                    }
-                    None => update_period.as_secs_f32(),
-                };
-                prev_update_instant = Some(now);
-
-                let input = Input { key_events: &keys, mouse_position, mouse_scroll, mouse_buttons };
-                match (f)(WindowEvent::Update { delta, input }) {
-                    Some(WindowTaskEx::Redraw) => window.request_redraw(),
-                    Some(WindowTaskEx::Exit) => window_target.exit(),
-                    None => (),
-                }
-
-                for k in keys.iter_mut() {
-                    k.state = KeyState::Held;
-                }
-                mouse_scroll = 0.0;
-                if mouse_buttons.left.is_some() { mouse_buttons.left = Some(KeyState::Held); }
-                if mouse_buttons.middle.is_some() { mouse_buttons.middle = Some(KeyState::Held); }
-                if mouse_buttons.right.is_some() { mouse_buttons.right = Some(KeyState::Held); }
-            },
-            winit::event::Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == window.id() => match event {
-                winit::event::WindowEvent::RedrawRequested => {
-                    let mut surface_texture = match surface.get_current_texture() {
-                        Ok(s) => s,
-                        Err(wgpu::SurfaceError::Timeout) => return,
-                        Err(e) => panic!("{}", e),
-                    };
-
-                    let surface_size = surface_texture.texture.size();
-                    if surface_size != output.depth_texture.size() {
-                        output.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                            size: surface_size,
-                            ..depth_texture_desc
-                        });
-                        output.depth_view = output.depth_texture.create_view(&Default::default())
-                    }
-
-                    take_mut::take(&mut surface_texture.texture, |texture| {
-                        let view = texture.create_view(&Default::default());
-                        let null_texture = std::mem::replace(&mut output.texture, texture);
-                        let null_view = std::mem::replace(&mut output.view, view);
-                        
-                        match (f)(WindowEvent::Redraw { output: &output }) {
-                            Some(WindowTaskEx::Redraw) => window.request_redraw(),
-                            Some(WindowTaskEx::Exit) => window_target.exit(),
-                            None => (),
-                        }
-
-                        let texture = std::mem::replace(&mut output.texture, null_texture);
-                        output.view = null_view;
-                        texture
-                    });
-                    window.pre_present_notify();
-                    surface_texture.present();
-                },
-                winit::event::WindowEvent::CursorMoved { position, .. } => {
-                    mouse_position = Some((position.x as f32, position.y as f32));
-                },
-                winit::event::WindowEvent::CursorLeft { .. } => {
-                    mouse_position = None;
-                },
-                winit::event::WindowEvent::MouseWheel { delta, .. } => {
-                    match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                            mouse_scroll += y;
-                        }
-                        _ => (),
-                    }
-                },
-                winit::event::WindowEvent::MouseInput { 
-                    state: winit::event::ElementState::Pressed, button, .. 
-                } => {
-                    match button {
-                        winit::event::MouseButton::Left => mouse_buttons.left = Some(KeyState::JustPressed),
-                        winit::event::MouseButton::Middle => mouse_buttons.middle = Some(KeyState::JustPressed),
-                        winit::event::MouseButton::Right => mouse_buttons.right = Some(KeyState::JustPressed),
-                        _ => (),
-                    }
-                },
-                winit::event::WindowEvent::MouseInput { 
-                    state: winit::event::ElementState::Released, button, .. 
-                } => {
-                    match button {
-                        winit::event::MouseButton::Left => mouse_buttons.left = None,
-                        winit::event::MouseButton::Middle => mouse_buttons.middle = None,
-                        winit::event::MouseButton::Right => mouse_buttons.right = None,
-                        _ => (),
-                    }
-                },
-                winit::event::WindowEvent::Resized(new_size) => {
-                    surface_config.width = new_size.width;
-                    surface_config.height = new_size.height;
-                    surface.configure(&self.device, &surface_config);
-                },
-                winit::event::WindowEvent::KeyboardInput {
-                    event: winit::event::KeyEvent { 
-                        state: winit::event::ElementState::Pressed, 
-                        physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
-                        .. 
-                    },
-                    ..
-                } => {
-                    // occurs during repeat presses
-                    if keys.iter().any(|k| k.key == *physical_key) { return };
-
-                    keys.push(KeyEvent { key: *physical_key, state: KeyState::JustPressed })
-                },
-                winit::event::WindowEvent::KeyboardInput {
-                    event: winit::event::KeyEvent { 
-                        state: winit::event::ElementState::Released, 
-                        physical_key: winit::keyboard::PhysicalKey::Code(physical_key), 
-                        .. 
-                    },
-                    ..
-                } => {
-                    keys.retain_mut(|k| k.key != *physical_key);
-                }
-                winit::event::WindowEvent::CloseRequested => window_target.exit(),
-                _ => (),
-            },
-            _ => (),
-        }).expect("error running event loop")
+        event_loop.run_app(&mut st).unwrap();
     }
 
     #[cfg(feature = "vello")]
@@ -781,6 +881,7 @@ impl Ctx {
                 module: &self.copy_shader,
                 entry_point: "vs_main",
                 buffers: &[],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.copy_shader,
@@ -794,6 +895,7 @@ impl Ctx {
                     },
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(), // tri list
             depth_stencil: None,
@@ -833,6 +935,7 @@ impl Ctx {
                 module: &self.copy_shader,
                 entry_point: "vs_main",
                 buffers: &[],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.copy_shader,
@@ -842,6 +945,7 @@ impl Ctx {
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(), // tri list
             depth_stencil: None,
@@ -951,6 +1055,7 @@ impl Ctx {
                 module: &wgpu_shader,
                 entry_point: desc.shader_vertex_entry,
                 buffers: vbuffers,
+                compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
                 topology: primitives,
@@ -984,7 +1089,8 @@ impl Ctx {
                     format: desc.output_format,
                     blend: desc.blend_state,
                     write_mask: wgpu::ColorWrites::ALL,
-                })]
+                })],
+                compilation_options: Default::default(),
             }),
             multiview: None,
         });
@@ -1080,6 +1186,7 @@ impl Ctx {
             layout: Some(&layout),
             module: &wgpu_shader,
             entry_point: desc.shader_entry,
+            compilation_options: Default::default(),
         });
 
         ComputePipeline {

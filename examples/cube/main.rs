@@ -51,7 +51,7 @@ fn main() {
     let render_cube = ctx.create_render_pipeline(RenderPipelineDescriptor {
         inputs: &[PipelineInput::Uniform(&time_uniform), PipelineInput::Uniform(&rotation_uniform)],
         vertex_buffer: &cube,
-        shader: include_str!("shader.wgsl").into(),
+        shader: ShaderSource::Str(include_str!("shader.wgsl")),
         shader_vertex_entry: "vertex",
         shader_fragment_entry: "fragment",
         output_format: OUTPUT_TEXTURE_FORMAT,

@@ -1,17 +1,6 @@
 use ezcompute::*;
 use glam::{i32::IVec3, f32::Mat4, f32::Vec3, f32::Quat};
 
-macro_rules! repeat {
-    ($n:expr, [ $($t:expr),+$(,)? ]) => {
-        const _LEN: usize = [$($t,)].len();
-        const _REP_COUNT: usize = $n / _LEN;
-        const _LEFT: usize = $n % _LEN;
-        [
-
-        ]
-    }
-}
-
 type ColourIdx = u16;
 
 #[derive(Copy, Clone, Debug)]
