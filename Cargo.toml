@@ -25,6 +25,7 @@ opt-level=2
 [dev-dependencies]
 fastrand = "2.1"
 glam = { version = "0.27", features = ["bytemuck"] }
+array_ex = "1.0.0"
 
 [features]
 default = ["winit"]
@@ -36,4 +37,8 @@ vello = ["dep:vello"]
 
 [[example]]
 name = "mandelbrot"
+required-features = ["images"]
+
+[[example]]
+name = "complex"
 required-features = ["images"]

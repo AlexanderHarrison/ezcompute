@@ -1622,10 +1622,12 @@ pub struct RenderPipeline<'a> {
     pub vertex_buffer: Option<&'a VertexBuffer>,
     pub instance_buffer: Option<&'a InstanceBuffer>,
     pub shader: ShaderSource,
-    pub draw_range: std::ops::Range<u32>,
-    pub instance_range: std::ops::Range<u32>,
     pub disable_depth_test: bool,
     pub output_format: wgpu::TextureFormat,
+
+    /// these fields can be modified at runtime
+    pub draw_range: std::ops::Range<u32>,
+    pub instance_range: std::ops::Range<u32>,
 }
 
 #[derive(Copy, Clone, Debug)]

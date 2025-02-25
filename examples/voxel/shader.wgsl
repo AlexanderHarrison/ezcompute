@@ -7,7 +7,7 @@ struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
     @location(0) @interpolate(flat) colour_idx: u32,
     @location(1) depth: f32,
-    //@location(1) pos2: vec4<f32>,
+    @location(2) @interpolate(flat) normal: vec3<f32>,
 }
 
 @vertex fn vertex(
@@ -39,45 +39,59 @@ struct VertexOutput {
     let y = i32((vertex_idx >> 1u) * 2 * (extent_y+1)) - 1;
 
     var v_offset: vec3<i32>;
+    var normal: vec3<f32>;
     switch (face) {
         // left
         case 0u {
             v_offset = vec3(-1, -y, x);
+            normal = vec3(-1.0, 0.0, 0.0);
         }
         // right
         case 1u {
             v_offset = vec3(1, y, x);
+            normal = vec3(1.0, 0.0, 0.0);
         }
         // down
         case 2u {
             v_offset = vec3(x, -1, -y);
+            normal = vec3(0.0, -1.0, 0.0);
         }
         // up
         case 3u {
             v_offset = vec3(x, 1, y);
+            normal = vec3(0.0, 1.0, 0.0);
         }
         // front
         case 4u {
             v_offset = vec3(x, y, -1);
+            normal = vec3(0.0, 0.0, -1.0);
         }
         // behind
         default {
-            v_offset = vec3(-x, y, 1);
+            v_offset = vec3(x, -y, 1);
+            normal = vec3(0.0, 0.0, 1.0);
         }
     }
 
     let screen_pos = camera * vec4(vec3<f32>(voxel_pos + v_offset), 1.0);
 
-    return VertexOutput(screen_pos, colour_idx, screen_pos.z / 100.0);
+    return VertexOutput(screen_pos, colour_idx, screen_pos.z / 100.0, normal);
 }
 
-const SQRT_2_R: f32 = 0.7071067811865475;
-const LIGHT_DIR: vec3<f32> = vec3(SQRT_2_R, 0.0, -SQRT_2_R);
+fn lighting(
+    colour: vec4<f32>, 
+    normal: vec3<f32>,
+    depth: f32,
+) -> vec4<f32> {
+    let R_SQRT_2: f32 = 1.0 / sqrt(2.0);
+    let R_SQRT_3: f32 = 1.0 / sqrt(3.0);
+    //let LIGHT_DIR: vec3<f32> = vec3(R_SQRT_3, R_SQRT_3, R_SQRT_3);
+    let LIGHT_DIR: vec3<f32> = vec3(R_SQRT_2, R_SQRT_2, 0.0);
+
+    let d = clamp(dot(LIGHT_DIR, normal) + 0.5, 0.0, 2.0) * 0.2 + 0.8;
+    return vec4(clamp(colour.rgb * vec3(d), vec3(0.0), vec3(1.0)), colour.a);
+}
+
 @fragment fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
-    return colours[input.colour_idx] * input.depth;
-    //let dx = dpdxFine(input.pos2.xyz);
-    //let dy = dpdyFine(input.pos2.xyz);
-    //let normal = normalize(cross(dx, dy));
-    //let d = dot(LIGHT_DIR, normal);
-    //return input.colour * clamp(d, 0.1, 1.0);
+    return lighting(colours[input.colour_idx], input.normal, input.depth);
 }

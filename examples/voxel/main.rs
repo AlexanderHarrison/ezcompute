@@ -49,7 +49,7 @@ impl Camera {
             1.0, 
             1.0,
             0.1,
-            32.0*10.0
+            64.0*10.0
         );
 
         let rotation_mat = Mat4::from_rotation_y(self.angle);
@@ -113,7 +113,7 @@ impl<'a> ChunkLayerMaskRange<'a> {
 
 impl<'a> ChunkLayerRange<'a> {
     /// voxel MUST be occupied
-    pub fn texture_idx(self, inner_pos: u16) -> ColourIdx {
+    pub fn texture_idx(self, inner_pos: u16) -> u16 {
         let y_idx = inner_pos as usize >> 10;
         let layer_start = self.layer_start;
         let layer_idx = inner_pos & 0x3FF;
@@ -201,6 +201,7 @@ pub struct ChunkToAdd<'a> {
     pub layer_start: u8,
 }
 
+#[derive(Clone, Debug)]
 pub struct Chunks {
     pub data: ChunkData,
     pub refs:  Vec<ChunkRef>,
@@ -457,20 +458,35 @@ fn main() {
     };
 
     const VOXEL_COLOURS: &'static [[f32; 4]] = &[
-        [1.0, 0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0, 1.0],
-        [0.0, 0.0, 1.0, 1.0],
+        [0.5, 0.2, 0.2, 1.0],
+        [0.2, 0.5, 0.2, 1.0],
+        [0.2, 0.2, 0.5, 1.0],
     ];
 
     let mut chunks = Chunks::new();
-    chunks.load(
-        &[IVec3::new(0, 0, 0)],
-        &[ChunkToAdd {
-            //layers: &[[1u16; 32*32]],
-            layers: &[[0, 1, 2, 3, 0, 1, 2, 3, ..0]],
-            layer_start: 10,
-        }],
-    );
+
+    //for x in -16..16 {
+    //    for z in -16..16 {
+    for x in 0..1 {
+        for z in 0..1 {
+            chunks.load(
+                &[IVec3::new(x, 0, z)],
+                &[ChunkToAdd {
+                    layers: &[
+                        //[((x+z) & 1) as u16+1; 32*32],
+                        array_ex::array![
+                            u16,
+                            [1; ..16],
+                            [1; ..32*4],
+                            [2; ..32*32],
+                        ]
+                    ],
+                    //layers: &[[0, 1, 2, 3, 0, 1, 2, 3, ..0]],
+                    layer_start: 2,
+                }],
+            );
+        }
+    }
     
     let ctx = Ctx::new();
 
