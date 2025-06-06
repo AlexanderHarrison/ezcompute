@@ -76,7 +76,7 @@ fn main() {
                 }
             }
 
-            data.time = start_time.elapsed().as_secs_f32();
+            data.time = (start_time.elapsed().as_secs_f32() - 2.0).max(0.0);
             data_uniform.update(&ctx, &data);
 
             if input.just_pressed(Key::KeyS) {

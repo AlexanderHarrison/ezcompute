@@ -53,13 +53,18 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // run complex function -------------------
 
-    let circle = vec2(cos(data.time), sin(data.time));
-    var z = vec2(0.0);
-    let n = 2.0;
-    for (var i = -n; i <= n+0.1; i += 1.0) {
-        let a = complex_mul(circle, complex_pow(complex_mul(circle, c), vec2(i, 0.0)));
-        z = complex_add(z, a);
-    }
+    //let circle = vec2(2.0*cos(data.time), sin(data.time));
+    //let z = complex_mul(complex_log(c), circle);
+
+    //let circle = vec2(cos(data.time), sin(data.time));
+    //var z = vec2(0.0);
+    //let n = 2.0;
+    //for (var i = -n; i <= n+0.1; i += 1.0) {
+    //    let a = complex_mul(circle, complex_pow(complex_mul(circle, c), vec2(i, 0.0)));
+    //    z = complex_add(z, a);
+    //}
+
+    let z = complex_pow(c, vec2(data.time, 0.0));
 
     // draw colours ----------------------------
 

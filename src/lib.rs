@@ -3,20 +3,20 @@ mod tests;
 
 use wgpu::util::DeviceExt;
 
-pub const OUTPUT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
-
 const DEBUG_LINES: bool = false;
 
 #[cfg(feature = "vello")]
 pub use vello;
 
 pub use wgpu;
+pub use bytemuck;
 
 pub struct Ctx {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub instance: wgpu::Instance,
 
+    pub output_texture_format: wgpu::TextureFormat,
     pub copy_pipeline_layout: wgpu::PipelineLayout,
     pub copy_bind_group_layout: wgpu::BindGroupLayout,
     pub copy_sampler_nearest: wgpu::Sampler,
@@ -29,12 +29,28 @@ pub struct Ctx {
     pub vello_renderer: std::cell::RefCell<vello::Renderer>,
 }
 
+pub struct CtxDescriptor {
+    pub srgb_output_format: bool,
+}
+
+impl Default for CtxDescriptor {
+    fn default() -> CtxDescriptor {
+        CtxDescriptor {
+            srgb_output_format: true,
+        }
+    }
+}
+
 impl Ctx {
     pub fn new() -> Self {
-        pollster::block_on(Self::new_async())
+        Self::new_ex(CtxDescriptor::default())
     }
 
-    pub async fn new_async() -> Self {
+    pub fn new_ex(desc: CtxDescriptor) -> Self {
+        pollster::block_on(Self::new_ex_async(desc))
+    }
+
+    pub async fn new_ex_async(desc: CtxDescriptor) -> Self {
         env_logger::init();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -48,6 +64,7 @@ impl Ctx {
                 label: None,
                 required_features: wgpu::Features::CLEAR_TEXTURE
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                    | wgpu::Features::TEXTURE_BINDING_ARRAY
                     | wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                     | if DEBUG_LINES {
@@ -59,6 +76,12 @@ impl Ctx {
             },
             None
         ).await.unwrap();
+
+        let output_texture_format = if desc.srgb_output_format {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Bgra8Unorm
+        };
 
         let copy_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -104,13 +127,14 @@ impl Ctx {
         #[cfg(feature = "vello")]
         let vello_renderer = std::cell::RefCell::new(vello::Renderer::new(&device, vello::RendererOptions {
             use_cpu: false,
-            surface_format: Some(OUTPUT_TEXTURE_FORMAT),
+            surface_format: Some(output_texture_format),
             antialiasing_support: vello::AaSupport::area_only(),
             num_init_threads: None,
         }).unwrap());
 
         Self {
             device, queue, instance,
+            output_texture_format,
             copy_pipeline_layout, copy_bind_group_layout, copy_sampler_linear, copy_sampler_nearest, copy_shader,
             alloc: Box::leak(Box::new(bumpalo::Bump::new())),
 
@@ -217,7 +241,7 @@ impl Ctx {
                 let size = window.inner_size();
                 let surface_config = wgpu::SurfaceConfiguration {
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    format: OUTPUT_TEXTURE_FORMAT,
+                    format: ctx.output_texture_format,
                     width: size.width,
                     height: size.height,
                     present_mode: wgpu::PresentMode::AutoVsync,
@@ -588,6 +612,17 @@ impl Ctx {
     //    write_thread.join().unwrap();
     //}
 
+    pub fn create_sampler(&self, oob: wgpu::AddressMode, filter: wgpu::FilterMode) -> wgpu::Sampler {
+        self.device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: oob,
+            address_mode_v: oob,
+            address_mode_w: oob,
+            mag_filter: filter,
+            min_filter: filter,
+            ..Default::default()
+        })
+    }
+
     pub fn create_instance_buffer<T: bytemuck::NoUninit>(
         &self, 
         desc: InstanceBufferDescriptor<'_, T>,
@@ -941,7 +976,7 @@ impl Ctx {
                 module: &self.copy_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: OUTPUT_TEXTURE_FORMAT,
+                    format: self.output_texture_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1635,6 +1670,7 @@ pub enum PipelineInput<'a> {
     Uniform(&'a Uniform),
     StorageBuffer(&'a StorageBuffer),
     Texture(&'a Texture),
+    Sampler(&'a wgpu::Sampler),
     StorageTexture(&'a Texture),
 }
 
@@ -1650,12 +1686,13 @@ impl<'a> PipelineInput<'a> {
             PipelineInput::Texture(texture) => wgpu::BindingResource::TextureView(
                 &texture.view
             ),
+            PipelineInput::Sampler(sampler) => wgpu::BindingResource::Sampler(sampler),
             PipelineInput::StorageTexture(texture) => wgpu::BindingResource::TextureView(
                 &texture.view
             ),
         }
     }
-
+    
     pub fn binding_type(self) -> wgpu::BindingType {
         match self {
             PipelineInput::Uniform(_) => wgpu::BindingType::Buffer {
@@ -1673,6 +1710,7 @@ impl<'a> PipelineInput<'a> {
                 view_dimension: wgpu::TextureViewDimension::D2,
                 multisampled: false,
             },
+            PipelineInput::Sampler(_) => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             PipelineInput::StorageTexture(texture) => wgpu::BindingType::StorageTexture {
                 access: wgpu::StorageTextureAccess::ReadOnly,
                 format: texture.texture.format(),
@@ -1968,24 +2006,44 @@ impl VertexBufferDescriptor<'static, [f32; 3]> {
 }
 
 impl Texture {
-    // TODO: type validation
     pub fn update<T: bytemuck::NoUninit>(&self, ctx: &Ctx, data: &[T]) {
         let size = self.texture.size();
+        self.update_rect(
+            ctx, data,
+            (size.width, size.height), size.width,
+            (0, 0),
+        );
+    }
 
-        let bytes_per_row = match self.texture.format().block_copy_size(None) {
-            Some(b) => size.width * b,
-            None => panic!("Texture::update: texture format cannot be updated (block_copy_size() returned None)"),
-        };
-
+    // TODO: type validation
+    /// Every X value is in units of `T`.
+    /// T **must** match the texel size of the texture.
+    pub fn update_rect<T: bytemuck::NoUninit>(
+        &self, ctx: &Ctx, data: &[T],
+        input_size: (u32, u32),
+        input_stride: u32,
+        output_offset: (u32, u32),
+    ) {
         ctx.queue.write_texture(
-            self.texture.as_image_copy(),
+            wgpu::ImageCopyTexture {
+                origin: wgpu::Origin3d {
+                    x: output_offset.0,
+                    y: output_offset.1,
+                    z: 0,
+                },
+                ..self.texture.as_image_copy()
+            },
             bytemuck::cast_slice(data),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(bytes_per_row),
+                bytes_per_row: Some(input_stride * std::mem::size_of::<T>() as u32),
                 rows_per_image: None,
             },
-            size,
+            wgpu::Extent3d {
+                width: input_size.0,
+                height: input_size.1,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
