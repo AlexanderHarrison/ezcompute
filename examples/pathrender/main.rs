@@ -1,7 +1,7 @@
 use ezcompute::*;
 use glam::{Vec2, Affine2};
 
-const F: f32 = 1.0;
+const F: f32 = 2.0;
 const W: u32 = (256.0 * F) as u32;
 const H: u32 = W;
 
@@ -260,11 +260,10 @@ impl Scene {
 mod gc_icons;
 
 fn main() {
-    const F: f32 = 2.0;
     let ctx = Ctx::new();
     
     let tform = Affine2::from_scale_angle_translation(
-        Vec2::splat(1.5),
+        Vec2::splat(F),
         0.0,
         Vec2::ZERO
     );
@@ -380,7 +379,7 @@ fn main() {
                 )),
             ]
         );*/
-    
+        
         points_buf.update(&ctx, &scene.points.as_slice());
         shapes_buf.update(&ctx, &scene.shapes.as_slice());
     
